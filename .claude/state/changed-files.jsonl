@@ -1,0 +1,17 @@
+{"file":"/home/cnmfs/.claude/plans/usando-habilidades-github-ops-uma-glowing-bonbon.md","action":"Write","timestamp":"2026-11-03T16:28:34Z","important":false}
+{"file":".github/CODEOWNERS","action":"Write","timestamp":"2026-11-03T18:01:35Z","important":false}
+{"file":"CLAUDE.md","action":"Write","timestamp":"2026-11-03T18:05:09Z","important":true}
+{"file":"AGENTS.md","action":"Write","timestamp":"2026-11-03T18:06:24Z","important":true}
+{"file":"scripts/stack_gate.py","action":"Write","timestamp":"2026-11-03T18:12:29Z","important":false}
+{"file":"scripts/kernel_build_gate.py","action":"Write","timestamp":"2026-11-03T18:37:01Z","important":false}
+{"file":".github/workflows/kernel-build.yml","action":"Write","timestamp":"2026-11-03T18:49:11Z","important":false}
+{"file":"objects/install-stack.json","action":"Write","timestamp":"2026-11-03T21:34:16Z","important":false}
+{"file":".github/workflows/stack-governance.yml","action":"Write","timestamp":"2026-11-03T21:51:59Z","important":false}
+{"file":".github/workflows/rom-build.yml","action":"Write","timestamp":"2026-11-03T21:55:43Z","important":false}
+{"file":"kernel/configs/evox_pong_pack.config","action":"Write","timestamp":"2026-11-03T22:00:39Z","important":false}
+{"file":"kernel/patches/SHA256SUMS","action":"Write","timestamp":"2026-11-03T22:05:16Z","important":false}
+{"file":"kernel/scripts/apply_patches.sh","action":"Write","timestamp":"2026-11-03T22:08:10Z","important":false}
+{"file":"scripts/rollout_gate.sh","action":"Write","timestamp":"2026-11-03T22:15:09Z","important":false}
+{"file":"state.md","action":"Edit","timestamp":"2026-11-03T22:19:31Z","important":false}
+{"file":".github/workflows/lint.yml","action":"Write","timestamp":"2026-11-03T22:21:22Z","important":false}
+{"file":"scripts/stack_gate.py","action":"Write","timestamp":"2026-11-03T22:30:31Z","important":false}

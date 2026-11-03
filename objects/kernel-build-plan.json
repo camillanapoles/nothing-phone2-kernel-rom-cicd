@@ -1,0 +1,666 @@
+{
+ "schema": "evox-kernel-build-plan/1",
+ "note": "Plano do kernel do par (custom-build). Cada requisito tem como PROVAR e como FALSIFICAR. Nada aqui é promessa: o gate kernel_build_gate.py cobra item por item, e --prebuild só fica verde quando o insumo existir. Ações pinadas por SHA (tag → commit conferido pela API em 2026-11-01).",
+ "target": {
+  "device": "pong",
+  "model": "Nothing Phone (2)",
+  "soc": "SM8475",
+  "android": "16 (API 36)",
+  "rom_build": "EvolutionX-16.0-20260915-Pong-11.11",
+  "kmi": "android13-5.10",
+  "kernel_base": "5.10.246 (Makefile do pin)",
+  "gki": true,
+  "partition": "boot.img (GKI, sem init_boot confirmado — checar payload.bin na L4)"
+ },
+ "source": {
+  "id": "lineageos-sm8475",
+  "url": "https://github.com/LineageOS/android_kernel_nothing_sm8475",
+  "branch": "lineage-23.2",
+  "pin": "4ec5491f6b5fd8776207a2a453d6b98b1928de7a",
+  "why": "fonte do device usada pelos kernels ativos do pong (NP² declara lineage-23.2 + gki_defconfig)",
+  "alternatives": [
+   {
+    "id": "box-de-kernel",
+    "status": "a_validar",
+    "note": "repo indicado pela usuária via GitHub; validar licença, branch, defconfig e patches antes de usar como fork. Se validar, entra como `fork` com pin próprio — nunca 'mais um' kernel no pack."
+   },
+   {
+    "id": "np2-kernel",
+    "url": "https://github.com/MiguVT/NP2_Kernel",
+    "status": "referência",
+    "why": "referência de build (workflow build.yml) — não é usado como kernel do pack (terceiro sem prova de build)"
+   },
+   {
+    "id": "meteoric",
+    "status": "rejeitado",
+    "why": "EOL (2025-06) e sem suporte declarado à build"
+   }
+  ],
+  "license_check": "GPL-2.0 (o GitHub reporta NOASSERTION; o SPDX do source e o COPYING é que valem) — manter e publicar as fontes modificadas",
+  "pin_date": "2026-01-24T02:47:16Z",
+  "pin_message": "treewide: Update changes to Pong-B4.0-251119-1654",
+  "pin_verified_by": [
+   "gh api repos/LineageOS/android_kernel_nothing_sm8475/branches/lineage-23.2 → commit.sha",
+   "arch/arm64/configs/gki_defconfig presente",
+   "arch/arm64/configs/vendor/waipio_GKI.config presente",
+   "arch/arm64/configs/vendor/nothing/waipio_GKI.config presente",
+   "arch/arm64/configs/vendor/debugfs.config presente",
+   "Makefile: VERSION=5 PATCHLEVEL=10 SUBLEVEL=246 → 5.10.246"
+  ],
+  "kmi_evidence": "o próprio pin é o tag de KMI: gki-g4ec5491f6b5f (12 primeiros hex do commit) — confere com o box e com `uname -r` esperado 5.10.246-gki-g4ec5491f6b5f"
+ },
+ "toolchain": {
+  "image": "ghcr.io/ylarod/ddk-min:android13-5.10-2025-04",
+  "note": "DDK é a via oficial do KernelSU para compilar LKM/module; para KSU embutido usamos o mesmo clang do DDK com o source completo",
+  "clang": "clang-r530567 (Android 14/15) — confirmar com `strings` do kernel stock na L4",
+  "llvm": "LLVM=1, LLVM_IAS=1",
+  "ccache": "habilitado, chave por (source pin + defconfig hash + patch set hash)"
+ },
+ "build": {
+  "defconfig": "gki_defconfig",
+  "fragments": [
+   "vendor/waipio_GKI.config",
+   "vendor/nothing/waipio_GKI.config",
+   "vendor/debugfs.config",
+   "arch/arm64/configs/evox_pong_pack.config"
+  ],
+  "pack_fragment": "arch/arm64/configs/evox_pong_pack.config",
+  "patch_set": [
+   {
+    "id": "001-kabi-sysvipc",
+    "file": "001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch",
+    "source": "https://github.com/ravindu644/Droidspaces-OSS (Documentation/Kernel-Configuration.md)",
+    "applies_to": ">=5.4 e <6.12",
+    "on_reject": "fail_build",
+    "on_reject_note": "build falha; proibido aplicar com force/fuzz",
+    "kind": "patch",
+    "sha256": "47fc945b2d73d9737d56c0f1c3a74cda0a95c30f9dc1b1abe546fa48940c4460",
+    "fallbacks": [
+     "001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch",
+     "001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch"
+    ],
+    "fallback_policy": "só em bootloop, um por vez, com registro do tentado; nunca aplicar dois 001 juntos"
+   },
+   {
+    "id": "002-mqueue-padding",
+    "file": "002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch",
+    "source": "https://github.com/ravindu644/Droidspaces-OSS (Documentation/Kernel-Configuration.md)",
+    "applies_to": "<=5.10",
+    "on_reject": "fail_build",
+    "on_reject_note": "build falha; proibido aplicar com force/fuzz",
+    "kind": "patch",
+    "sha256": "31982c85f4a65ca3ec71d27903626fb0234a39c4d3e99667bc849918e42693b7"
+   },
+   {
+    "id": "003-kernelsu-embedded",
+    "kind": "tree_integration",
+    "how": "copiar drivers/kernelsu do KernelSU-Next v3.4.2 (ramo gki-android13-5.10) e ligar em Kconfig/Makefile",
+    "source": "https://github.com/KernelSU-Next/KernelSU-Next (v3.4.2)",
+    "applies_to": "5.10 GKI",
+    "on_reject": "fail_build",
+    "on_reject_note": "integração não entra limpa ⇒ build falha; proibido force/fuzz"
+   },
+   {
+    "id": "004-susfs",
+    "kind": "tree_integration",
+    "how": "aplicar a série do susfs4ksu (tag fixada) por cima do KernelSU-Next; rejeição limpa",
+    "source": "https://gitlab.com/simonpunk/susfs4ksu (tag fixada)",
+    "applies_to": "5.10",
+    "on_reject": "drop_patch",
+    "on_reject_note": "build segue sem SUSFS (fallback declarado); ocultação cai para Zygisk Next"
+   }
+  ],
+  "lto": "thin",
+  "jobs": "nproc",
+  "reproducible": [
+   "SOURCE_DATE_EPOCH fixo",
+   "sem -j aleatório no registro",
+   "sha256 de Image, .config e zip AK3"
+  ],
+  "repo_fragment": "kernel/fragments/evox_pong_pack.config",
+  "material": {
+   "repo_dir": "kernel/",
+   "fragment_generator": "scripts/kernel-fragment.py",
+   "fragment_source": "skills/evox-rom-ci-optimizer/references/droidspaces-requirements.json",
+   "patches_dir": "kernel/patches/",
+   "patches_manifest": "kernel/patches/SHA256SUMS",
+   "patches_source": "https://github.com/ravindu644/Droidspaces-OSS (Documentation/resources/kernel-patches/GKI/below-kernel-6.12)",
+   "patches_source_pin": "58e3f4e2c909adc3d8bb2a5c9ac914591bb16725",
+   "patches_source_date": "2026-11-01T19:07:31Z",
+   "why": "o material entra no build por cópia (CI) e é conferido por sha256; o fragmento é gerado do contrato para não existirem duas verdades"
+  }
+ },
+ "configs": {
+  "contract": [
+   "CONFIG_SYSVIPC",
+   "CONFIG_POSIX_MQUEUE",
+   "CONFIG_NAMESPACES",
+   "CONFIG_UTS_NS",
+   "CONFIG_IPC_NS",
+   "CONFIG_PID_NS",
+   "CONFIG_NET_NS",
+   "CONFIG_USER_NS",
+   "CONFIG_CGROUPS",
+   "CONFIG_CGROUP_PIDS",
+   "CONFIG_CGROUP_FREEZER",
+   "CONFIG_SECCOMP",
+   "CONFIG_DEVTMPFS"
+  ],
+  "module_specific": [
+   {
+    "config": "CONFIG_KSU",
+    "module": "M01",
+    "kind": "to_confirm",
+    "confirm_in": "arch/arm64/configs/evox_pong_pack.config"
+   },
+   {
+    "config": "CONFIG_KPM",
+    "module": "M01",
+    "kind": "to_confirm",
+    "confirm_in": "arch/arm64/configs/evox_pong_pack.config"
+   },
+   {
+    "config": "CONFIG_KALLSYMS",
+    "module": "M01",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig (já ligado no GKI)"
+   },
+   {
+    "config": "CONFIG_KALLSYMS_ALL",
+    "module": "M01",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_SUSFS",
+    "module": "M08",
+    "kind": "to_confirm",
+    "confirm_in": "arch/arm64/configs/evox_pong_pack.config"
+   },
+   {
+    "config": "CONFIG_NETFILTER",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_NETFILTER_XT_MATCH_OWNER",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_NETFILTER_XT_TARGET_TPROXY",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_BPF_SYSCALL",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_BPF_JIT",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_NET_CLS_BPF",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_NET_ACT_BPF",
+    "module": "M10",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_CPU_FREQ_GOV_SCHEDUTIL",
+    "module": "M12A",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_THERMAL",
+    "module": "M12A",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_DMA_SHARED_BUFFER",
+    "module": "M12B",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_SECURITY_SELINUX",
+    "module": "M08",
+    "kind": "to_confirm",
+    "confirm_in": "gki_defconfig"
+   },
+   {
+    "config": "CONFIG_DEBUG_FS",
+    "module": "M12A",
+    "kind": "to_confirm",
+    "confirm_in": "vendor/debugfs.config"
+   },
+   {
+    "config": "CONFIG_IKCONFIG",
+    "module": "M05",
+    "kind": "to_confirm",
+    "confirm_in": "vendor/debugfs.config"
+   },
+   {
+    "config": "CONFIG_IKCONFIG_PROC",
+    "module": "M05",
+    "kind": "to_confirm",
+    "confirm_in": "vendor/debugfs.config"
+   }
+  ]
+ },
+ "requirements": {
+  "functional": [
+   {
+    "id": "FR-01",
+    "statement": "o kernel sobe no pong com a build pinada (boot completo, sem kernel panic)",
+    "module": "M01",
+    "verified_by": "boot.ok + dmesg sem 'Kernel panic' + 10 min de uptime (AVD/staging, depois físico)",
+    "falsified_by": "flash do boot.img + reboot: qualquer panic/loop reprova"
+   },
+   {
+    "id": "FR-02",
+    "statement": "KernelSU-Next v3.4.2 concede root (Manager abre, `su -c id -u` = 0)",
+    "module": "M01",
+    "verified_by": "ksud/Manager + `su -c 'id -u'`",
+    "falsified_by": "sem root ou Manager recusando o kernel → reprova"
+   },
+   {
+    "id": "FR-03",
+    "statement": "SUSFS ativo e listando (ou fallback declarado sem SUSFS)",
+    "module": "M08",
+    "verified_by": "`ksud susfs`/proc + /sys/fs/susfs presente",
+    "falsified_by": "se o patch SUSFS foi aplicado e a interface não existe → reprova"
+   },
+   {
+    "id": "FR-04",
+    "statement": "DroidSpaces sobe container com PID/IPC/UTS/NET/USER namespaces",
+    "module": "M05",
+    "verified_by": "app Droidspaces > Check Requirements + `unshare`/container real",
+    "falsified_by": "qualquer requisito marcado faltando no app → reprova"
+   },
+   {
+    "id": "FR-05",
+    "statement": "SYSVIPC/POSIX_MQUEUE utilizáveis dentro do container",
+    "module": "M05",
+    "verified_by": "leitura de /proc/sysvipc/{shm,sem,msg} e /dev/mqueue no container",
+    "falsified_by": "ENOSYS/EINVAL ao criar shm/mq → reprova"
+   },
+   {
+    "id": "FR-06",
+    "statement": "rede por app funciona (M10): netfilter owner + eBPF carregam",
+    "module": "M10",
+    "verified_by": "iptables -m owner + carga de programa BPF",
+    "falsified_by": "regra owner não aplica ou BPF rejeitado → reprova"
+   },
+   {
+    "id": "FR-07",
+    "statement": "faixas de CPU/GPU e thermal controláveis (M12A)",
+    "module": "M12A",
+    "verified_by": "cpufreq/gpu devfreq + zonas térmicas legíveis e alteráveis",
+    "falsified_by": "nó ausente ou escrita negada → reprova"
+   },
+   {
+    "id": "FR-08",
+    "statement": "NPU/QAIRT abre sem regressão de kernel (M12B)",
+    "module": "M12B",
+    "verified_by": "libcdsprpc/NPU init log + inference de fumaça",
+    "falsified_by": "timeout/crash no primeiro uso → reprova"
+   },
+   {
+    "id": "FR-09",
+    "statement": "integridade do device mantida (M07/M08): DEVICE_INTEGRITY passa",
+    "module": "M07",
+    "verified_by": "Play Integrity API com PIFork+TrickyStore",
+    "falsified_by": "MEETS_DEVICE_INTEGRITY falso → reprova"
+   },
+   {
+    "id": "FR-10",
+    "statement": "rollback byte-idêntico ao kernel stock da build",
+    "module": "M01",
+    "verified_by": "guard4_verify.sh (backup + sha256) antes de qualquer flash",
+    "falsified_by": "hash divergente ou backup ausente → bloqueia"
+   },
+   {
+    "id": "FR-11",
+    "statement": "OTA da ROM tem plano: rebuild com o mesmo patch set + refazer M01",
+    "module": "M14",
+    "verified_by": "documento do par + script de rebuild reprodutível",
+    "falsified_by": "build nova sem pin de source/patch → reprova"
+   }
+  ],
+  "non_functional": [
+   {
+    "id": "NFR-01",
+    "statement": "build reprodutível: mesmo (source pin, configs, patch set) ⇒ mesmo sha256 de Image e .config",
+    "verified_by": "dois builds no CI comparando sha256",
+    "falsified_by": "sha diferente em duas execuções idênticas"
+   },
+   {
+    "id": "NFR-02",
+    "statement": "tempo de build ≤ 90 min no runner padrão (ubuntu-latest, 4 vCPU) com ccache frio",
+    "verified_by": "tempo do job no CI",
+    "falsified_by": "job > 90 min ou timeout"
+   },
+   {
+    "id": "NFR-03",
+    "statement": "nenhum patch aplicado com --force/fuzz>0 (rejeitado = falha)",
+    "verified_by": "log de `patch -p1 --dry-run` + git apply --check",
+    "falsified_by": "algum .rej ou fuzz aceito"
+   },
+   {
+    "id": "NFR-04",
+    "statement": "todo artefato publicado tem sha256 + proveniência (attestation)",
+    "verified_by": "release com SHA256SUMS + attest-build-provenance",
+    "falsified_by": "artefato sem hash/proveniência"
+   },
+   {
+    "id": "NFR-05",
+    "statement": "ações do workflow pinadas por SHA de 40 hex (sem tag flutuante)",
+    "verified_by": "kernel_build_gate.py + ci_workflow_lint.py",
+    "falsified_by": "uso de @vN sem SHA"
+   },
+   {
+    "id": "NFR-06",
+    "statement": "sem regressão de estabilidade: 0 panic/0 crash de kernel em 72 h de uso (fase de teste)",
+    "verified_by": "pstore/ramoops + dmesg + uptime",
+    "falsified_by": "qualquer panic/oom-kill anômalo"
+   },
+   {
+    "id": "NFR-07",
+    "statement": "impacto de performance ≤ 3% nos benchmarks de referência vs kernel stock",
+    "verified_by": "mesma bateria antes/depois (geo/sysbench/compilação)",
+    "falsified_by": "queda > 3%"
+   },
+   {
+    "id": "NFR-08",
+    "statement": "tamanho do boot.img ≤ stock + 5% (cabe no slot sem reparticionar)",
+    "verified_by": "tamanho do artefato vs stock",
+    "falsified_by": "exceder o limite do slot"
+   },
+   {
+    "id": "NFR-09",
+    "statement": "licença GPL-2.0 cumprida: fonte modificada publicada junto do binário",
+    "verified_by": "tag/release com diff do patch set",
+    "falsified_by": "binário sem fonte correspondente"
+   },
+   {
+    "id": "NFR-10",
+    "statement": "build não depende de segredo: roda em fork público sem PAT",
+    "verified_by": "workflow_dispatch em fork limpo",
+    "falsified_by": "falha por falta de secret"
+   }
+  ]
+ },
+ "actions": [
+  {
+   "use": "actions/checkout",
+   "version": "v7.0.1",
+   "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+   "released_at": "2026-07-20",
+   "source": "https://github.com/actions/checkout/releases/tag/v7.0.1",
+   "why": "clonar source + patch set",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "actions/cache",
+   "version": "v6.1.0",
+   "sha": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+   "released_at": "2026-06-26",
+   "source": "https://github.com/actions/cache/releases/tag/v6.1.0",
+   "why": "ccache entre builds",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "actions/upload-artifact",
+   "version": "v7.0.2",
+   "sha": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+   "released_at": "2026-10-07",
+   "source": "https://github.com/actions/upload-artifact/releases/tag/v7.0.2",
+   "why": "Image, .config, AK3, logs",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "actions/download-artifact",
+   "version": "v8.0.2",
+   "sha": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+   "released_at": "2026-10-07",
+   "source": "https://github.com/actions/download-artifact/releases/tag/v8.0.2",
+   "why": "job de release consome o build",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "actions/attest-build-provenance",
+   "version": "v4.2.2",
+   "sha": "4d101475d8b20a2381f78447822ac1eab6504dd8",
+   "released_at": "2026-08-06",
+   "source": "https://github.com/actions/attest-build-provenance/releases/tag/v4.2.2",
+   "why": "proveniência do boot.img",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "softprops/action-gh-release",
+   "version": "v3.0.3",
+   "sha": "efb35369e0ad2afab669f228072c1b0d510eae64",
+   "released_at": "2026-08-30",
+   "source": "https://github.com/softprops/action-gh-release/releases/tag/v3.0.3",
+   "why": "release draft com SHA256SUMS",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  },
+  {
+   "use": "sigstore/cosign-installer",
+   "version": "v4.1.2",
+   "sha": "6f9f17788090df1f26f669e9d70d6ae9567deba6",
+   "released_at": "2026-05-07",
+   "source": "https://github.com/sigstore/cosign-installer/releases/tag/v4.1.2",
+   "why": "assinar o artefato",
+   "sha_source": "tag resolvido via API do GitHub em 2026-11-01"
+  }
+ ],
+ "actions_avoided": [
+  {
+   "id": "lemniskett/android-kernel-actions",
+   "stars": 85,
+   "why": "wrapper de terceiro sem pin de toolchain verificável; menos auditável que o nosso build.sh explícito"
+  },
+  {
+   "id": "feicong/android-kernel-build-action",
+   "stars": 56,
+   "why": "foco em módulos GKI (LKM); não serve para KSU embutido + SUSFS no source"
+  },
+  {
+   "id": "zclkkk/kernel_build",
+   "stars": 108,
+   "why": "build genérico ARM64; não cobre patches kABI/SUSFS nem reprodutibilidade"
+  },
+  {
+   "id": "UnicomAndroid/kerneler",
+   "stars": 176,
+   "why": "idem — usado como referência de estrutura, não como dependência"
+  }
+ ],
+ "artifacts": [
+  {
+   "name": "Image",
+   "sha256_required": true
+  },
+  {
+   "name": "boot.img",
+   "sha256_required": true,
+   "attest": true
+  },
+  {
+   "name": "dtbo.img",
+   "sha256_required": true,
+   "note": "se a build pinada usar dtbo"
+  },
+  {
+   "name": "evox_pong_pack.config",
+   "sha256_required": true,
+   "note": "prova de C06 — é o input do solver"
+  },
+  {
+   "name": "kernel-config.json",
+   "sha256_required": true,
+   "note": "formato aceito por droidspaces_preflight.py --kernel-evidence"
+  },
+  {
+   "name": "AnyKernel3 zip",
+   "sha256_required": true,
+   "note": "instalação por recovery como caminho alternativo"
+  },
+  {
+   "name": "SHA256SUMS",
+   "sha256_required": true
+  }
+ ],
+ "deploy": {
+  "steps": [
+   "release DRAFT (nunca pública direto)",
+   "baixar o artefato do draft e conferir sha256 contra SHA256SUMS",
+   "verificar attestation (gh attestation verify)",
+   "flash só em staging/AVD primeiro; físico só depois do PASS de staging",
+   "guard4_verify.sh antes de qualquer `fastboot flash boot`",
+   "publicar release com fonte (GPL)"
+  ],
+  "forbidden": [
+   "fastboot flash no CI",
+   "flash sem backup verificado",
+   "usar release sem hash conferido"
+  ]
+ },
+ "validation": [
+  {
+   "module": "M01",
+   "check": "su -c 'id -u' == 0 + Manager reconhece o kernel",
+   "expected": "root ativo, SELinux Enforcing",
+   "falsified_by": "sem root ou Manager recusando"
+  },
+  {
+   "module": "M02",
+   "check": "câmera abre e grava (GCam + flags HAL) após o kernel novo",
+   "expected": "sem erro de HAL",
+   "falsified_by": "câmera falha/crash"
+  },
+  {
+   "module": "M03",
+   "check": "Play Store e serviços Google sobem",
+   "expected": "login e sync ok",
+   "falsified_by": "GMS crashando"
+  },
+  {
+   "module": "M04",
+   "check": "captura de tela irrestrita funciona",
+   "expected": "captura sem bloqueio",
+   "falsified_by": "app bloqueia captura"
+  },
+  {
+   "module": "M05",
+   "check": "Droidspaces Check Requirements + container real (PID/IPC/UTS/NET/USER)",
+   "expected": "todos os requisitos OK; shm/mq utilizáveis",
+   "falsified_by": "requisito faltando ou ENOSYS"
+  },
+  {
+   "module": "M06",
+   "check": "janelas free-form abrem e redimensionam",
+   "expected": "multi-janela ok",
+   "falsified_by": "app não abre em free-form"
+  },
+  {
+   "module": "M07",
+   "check": "Play Integrity (PIFork + TrickyStore)",
+   "expected": "MEETS_DEVICE_INTEGRITY",
+   "falsified_by": "apenas BASIC"
+  },
+  {
+   "module": "M08",
+   "check": "ocultação por app (lista R08) + SUSFS ativo",
+   "expected": "app alvo não detecta root",
+   "falsified_by": "detecção de root"
+  },
+  {
+   "module": "M09",
+   "check": "SAF monta diretório externo",
+   "expected": "leitura/escrita ok",
+   "falsified_by": "permissão negada"
+  },
+  {
+   "module": "M10",
+   "check": "netfilter owner + carga de BPF por app",
+   "expected": "regra aplicada só ao app",
+   "falsified_by": "regra não aplica ou BPF rejeitado"
+  },
+  {
+   "module": "M11",
+   "check": "port-forward intranet responde",
+   "expected": "porta acessível na LAN",
+   "falsified_by": "conexão recusada"
+  },
+  {
+   "module": "M12A",
+   "check": "cpufreq/GPU/thermal legíveis e controláveis",
+   "expected": "controle efetivo",
+   "falsified_by": "nó ausente ou escrita negada"
+  },
+  {
+   "module": "M12B",
+   "check": "NPU/QAIRT inicializa e roda inferência de fumaça",
+   "expected": "sem erro",
+   "falsified_by": "timeout/crash"
+  },
+  {
+   "module": "M13",
+   "check": "pipeline do CI de ambiente roda ponta a ponta",
+   "expected": "job verde",
+   "falsified_by": "job falha"
+  },
+  {
+   "module": "M14",
+   "check": "snapshot por camada restaura estado",
+   "expected": "rollback fiel",
+   "falsified_by": "snapshot inconsistente"
+  },
+  {
+   "module": "M15",
+   "check": "Release Artifact validado antes de qualquer USB",
+   "expected": "artefato + hash conferidos",
+   "falsified_by": "artefato sem hash/proveniência"
+  }
+ ],
+ "risks": [
+  {
+   "id": "R1",
+   "risk": "SUSFS colide com os patches kABI",
+   "mitigation": "build sem SUSFS (fallback declarado) — nunca --force"
+  },
+  {
+   "id": "R2",
+   "risk": "fragmento vendor/waipio_GKI.config não existe no source",
+   "mitigation": "gate --prebuild confere a árvore; sem ele, usar só gki_defconfig + nosso fragment"
+  },
+  {
+   "id": "R3",
+   "risk": "init_boot separado",
+   "mitigation": "L4 confirma layout; se existir, M01 cobre as duas partições"
+  },
+  {
+   "id": "R4",
+   "risk": "clang incompatível com o source",
+   "mitigation": "pin do toolchain + build reprodutível no CI antes de qualquer flash"
+  }
+ ]
+}

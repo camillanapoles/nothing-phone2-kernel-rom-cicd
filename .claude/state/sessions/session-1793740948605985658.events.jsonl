@@ -1,0 +1,11 @@
+{"id":"event-000001","type":"session.stop","ts":"2026-11-03T13:41:28Z","state":"stopped"}
+{"id":"event-000001","type":"session.stop","ts":"2026-11-03T15:20:39Z","state":"stopped"}
+{"id":"event-000002","type":"session.stop","ts":"2026-11-03T16:30:54Z","state":"stopped"}
+{"id":"event-000003","type":"session.stop","ts":"2026-11-03T16:37:42Z","state":"stopped"}
+{"id":"event-000025","type":"session.stop","ts":"2026-11-03T19:09:35Z","state":"stopped"}
+{"id":"event-000017","type":"session.stop","ts":"2026-11-03T19:29:44Z","state":"stopped"}
+{"id":"event-000021","type":"session.stop","ts":"2026-11-03T21:18:02Z","state":"stopped"}
+{"id":"event-000005","type":"session.stop","ts":"2026-11-03T21:19:32Z","state":"stopped"}
+{"id":"event-000001","type":"session.stop","ts":"2026-11-03T21:20:25Z","state":"stopped"}
+{"id":"event-000016","type":"session.stop","ts":"2026-11-03T21:21:42Z","state":"stopped"}
+{"id":"event-000002","type":"session.stop","ts":"2026-11-03T21:22:48Z","state":"stopped"}

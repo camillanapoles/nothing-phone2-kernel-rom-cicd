@@ -1,0 +1,60 @@
+{
+  "changes_this_session": [],
+  "channels_wake": {
+    "healthy": true,
+    "last_checked": "2026-11-03T21:53:23Z",
+    "last_error": ""
+  },
+  "cwd": "/home/cnmfs/nothing-phone2.1",
+  "duration_minutes": 0,
+  "ended_at": "2026-11-03T21:53:40Z",
+  "event_seq": 0,
+  "fork_count": 0,
+  "git": {
+    "branch": "main",
+    "last_commit": "117d29f",
+    "uncommitted_changes": 0
+  },
+  "harness_mem": {
+    "healthy": true,
+    "last_checked": "2026-11-03T21:53:23Z",
+    "last_error": ""
+  },
+  "intent": "literal",
+  "last_event_id": "",
+  "memory_logged": true,
+  "night_watch": {
+    "healthy": true,
+    "last_checked": "2026-11-03T21:53:23Z",
+    "last_error": ""
+  },
+  "orchestration": {
+    "max_state_retries": 3,
+    "retry_backoff_seconds": 10
+  },
+  "parent_session_id": null,
+  "plans": {
+    "completed_tasks": 0,
+    "exists": false,
+    "last_modified": 0,
+    "pending_tasks": 0,
+    "todo_tasks": 0,
+    "wip_tasks": 0
+  },
+  "project_name": "nothing-phone2.1",
+  "prompt_seq": 2,
+  "release_candidate": {
+    "age_days": 0,
+    "bump": "",
+    "last_checked": "2026-11-03T21:53:23Z",
+    "state": "not-applicable",
+    "tag": "",
+    "threshold_days": 0
+  },
+  "resume_token": "resume-1793742802300044630",
+  "session_id": "session-1793742802300033067",
+  "started_at": "2026-11-03T21:53:22Z",
+  "state": "stopped",
+  "state_version": 1,
+  "updated_at": "2026-11-03T21:53:23Z"
+}

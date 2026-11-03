@@ -1,0 +1,27 @@
+# Code owners for Nothing Phone 2 CI/CD Pipeline
+
+# Kernel build workflows
+.github/workflows/kernel-build.yml        @mechanical-coder @android-architect
+
+# Stack governance
+.github/workflows/stack-governance.yml   @mechanical-coder @security-reviewer
+
+# Object definitions (source of truth)
+objects/*.json                              @mechanical-coder
+
+# Validation scripts
+scripts/stack_gate.py                       @mechanical-coder
+scripts/kernel_build_gate.py                @mechanical-coder
+
+# Kernel configuration and patches
+kernel/configs/*.config                     @mechanical-coder
+kernel/patches/*.patch                      @mechanical-coder
+
+# Installation sequence
+INSTALL-SEQUENCE.md                         @mechanical-coder
+
+# Catch-all for kernel directory
+kernel/**                                   @mechanical-coder
+
+# Documentation
+*.md                                      @mechanical-coder @documentation-writer

@@ -1,0 +1,58 @@
+{
+ "schema": "evox-kernel-candidates/1",
+ "note": "fixture: kernel fictício 'kernel-x' com evidência completa — o selftest quebra uma condição por vez",
+ "rom_target": {
+  "build": "EvolutionX-16.0-20260915-Pong-11.11",
+  "android_api": 36,
+  "device": "pong",
+  "soc": "SM8475"
+ },
+ "candidates": [
+  {
+   "id": "kernel-x",
+   "name": "Kernel fictício X",
+   "origin": "custom-build",
+   "model": "pong",
+   "soc": "SM8475",
+   "android_api": 36,
+   "android_release": "16",
+   "kmi": "android13-5.10",
+   "kernel_base": "5.10",
+   "gki": true,
+   "supported_rom_builds": [
+    "EvolutionX-16.0-20260915-Pong-11.11"
+   ],
+   "developer_support": {
+    "declared": true,
+    "source": "fixture"
+   },
+   "stale_days": 0,
+   "status": "certified",
+   "kernel_supports": [
+    "engine-x"
+   ],
+   "kernel_supports_susfs": true,
+   "configs_extra": [],
+   "configs_proven": [
+    "CONFIG_CGROUPS",
+    "CONFIG_CGROUP_FREEZER",
+    "CONFIG_CGROUP_PIDS",
+    "CONFIG_IPC_NS",
+    "CONFIG_NAMESPACES",
+    "CONFIG_NET_NS",
+    "CONFIG_PID_NS",
+    "CONFIG_POSIX_MQUEUE",
+    "CONFIG_SECCOMP",
+    "CONFIG_SYSVIPC",
+    "CONFIG_USER_NS",
+    "CONFIG_UTS_NS"
+   ],
+   "patches_present": [
+    "001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch",
+    "002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+   ],
+   "rollback": "boot_stock_rollback.img (fixture)",
+   "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  }
+ ]
+}

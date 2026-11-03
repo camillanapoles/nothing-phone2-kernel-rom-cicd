@@ -1,0 +1,125 @@
+{
+  "stack_name": "nothing-phone2-kernel-rom-cicd",
+  "layers": {
+    "1": {"name": "source_control", "type": "git", "required": true},
+    "2": {"name": "build_toolchain", "type": "clang", "version": "r530567", "required": true},
+    "3": {"name": "kernel_source", "type": "lineageos", "repo": "LineageOS/android_kernel_nothing_sm8475", "commit": "4ec5491f6b5f", "required": true},
+    "4": {"name": "rom_source", "type": "evolution_x", "repo": "EvolutionXMobile/android_packages_apps_EvolutionX", "commit": "26be9ac8bb21", "required": true},
+    "5": {"name": "gapps_source", "type": "open_gapps", "commit": "79236f9b4259", "required": false},
+    "6": {"name": "kernel_patches", "type": "droidspaces_kabi", "patches": ["001-kabi-sysvipc", "002-mqueue-padding"], "required": true},
+    "7": {"name": "kernel_su", "type": "kernelsu", "version": "v3.4.2-next", "embedded": true},
+    "8": {"name": "susfs_module", "type": "susfs", "version": "R28", "required": true},
+    "9": {"name": "gki_config", "type": "gki_defconfig", "base": "common", "required": true},
+    "10": {"name": "device_config", "type": "evox_pong_pack", "required": true},
+    "11": {"name": "ccache", "type": "ccache_persistence", "required": true},
+    "12": {"name": "build_verification", "type": "sha256_manifest", "required": true},
+    "13": {"name": "provenance_attestation", "type": "attest", "source": "actions/attest-build-provenance", "required": true},
+    "14": {"name": "artifact_packaging", "type": "anykernel3", "required": true},
+    "15": {"name": "release_publishing", "type": "github_release", "draft": true, "required": true},
+    "16": {"name": "slot_a_deployment", "type": "fastboot_single_slot", "required": true}
+  },
+  "invariants": [
+    {
+      "id": "INV-01",
+      "name": "pinned_actions_integrity",
+      "description": "All GitHub Actions must use full 40-character SHA hashes",
+      "enforcement": "stack_gate.py verifies no @vN tags in workflow files"
+    },
+    {
+      "id": "INV-02",
+      "name": "sha256_verification",
+      "description": "All build artifacts must have SHA256 checksums",
+      "enforcement": "kernel_build_gate.py validates checksums exist and match"
+    },
+    {
+      "id": "INV-03",
+      "name": "single_slot_execution",
+      "description": "Installation sequence must target Slot A only",
+      "enforcement": "INSTALL-SEQUENCE.md and rollout_gate.sh enforce Slot A"
+    },
+    {
+      "id": "INV-04",
+      "name": "kernel_commit_locked",
+      "description": "Kernel source must be built from pinned LineageOS commit",
+      "enforcement": "kernel-build-plan.json defines exact commit hash"
+    },
+    {
+      "id": "INV-05",
+      "name": "gki_compliance",
+      "description": "Kernel must be built with GKI-compliant config",
+      "enforcement": "evox_pong_pack.config includes GKI requirements"
+    },
+    {
+      "id": "INV-06",
+      "name": "patch_application_order",
+      "description": "DroidSpaces patches must be applied before KernelSU and SUSFS",
+      "enforcement": "apply_patches.sh applies patches in defined order"
+    },
+    {
+      "id": "INV-07",
+      "name": "toolchain_version_locked",
+      "description": "Build must use clang-r530567 toolchain",
+      "enforcement": "kernel-build-plan.json specifies toolchain version"
+    },
+    {
+      "id": "INV-08",
+      "name": "no_binary_commit",
+      "description": "No modified binaries in repository root",
+      "enforcement": "Git pre-commit hook blocks .img, .zip files"
+    },
+    {
+      "id": "INV-09",
+      "name": "provenance_transparency",
+      "description": "All builds must generate attestation records",
+      "enforcement": "CI workflow runs attest-build-provenance action"
+    },
+    {
+      "id": "INV-10",
+      "name": "secretless_operation",
+      "description": "Pipeline must work without PATs on public forks",
+      "enforcement": "No secrets required for checkout/build steps"
+    },
+    {
+      "id": "INV-11",
+      "name": "gpl_compliance",
+      "description": "Modified kernel sources must be published with binaries",
+      "enforcement": "Release artifacts include SOURCE.tar.gz with kernel sources"
+    },
+    {
+      "id": "INV-12",
+      "name": "config_fragment_integration",
+      "description": "Device config must be merged with GKI base defconfig",
+      "enforcement": "build script combines gki_defconfig + evox_pong_pack.config"
+    },
+    {
+      "id": "INV-13",
+      "name": "su_module_version",
+      "description": "KernelSU-Next must be exactly v3.4.2",
+      "enforcement": "kernel-build-plan.json specifies version"
+    },
+    {
+      "id": "INV-14",
+      "name": "susfs_version",
+      "description": "SUSFS module must be R28 or compatible",
+      "enforcement": "kernel-build-plan.json specifies version"
+    },
+    {
+      "id": "INV-15",
+      "name": "rom_version_tag",
+      "description": "ROM builds must be tagged with Evolution X 11.11",
+      "enforcement": "rom-artifacts.json specifies version tag"
+    },
+    {
+      "id": "INV-16",
+      "name": "candidate_validation",
+      "description": "Kernel candidates must pass fixture certification",
+      "enforcement": "kernel-candidates.json validated against expected outcomes"
+    }
+  ],
+  "metadata": {
+    "description": "21-layer build stack specification for Nothing Phone 2 kernel/ROM CI/CD",
+    "created": "2024-01-15",
+    "last_modified": "2024-01-15",
+    "compliance_standard": "NFR-05 (Pinned Actions), NFR-10 (Secretless Build)"
+  }
+}

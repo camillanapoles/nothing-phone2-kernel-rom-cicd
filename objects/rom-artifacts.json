@@ -1,0 +1,63 @@
+{
+  "schema": "evox-rom-artifacts/2",
+  "device": "Pong",
+  "android": "16",
+  "build": "2026-09-15",
+  "version": "11.11",
+  "source_page": "https://evolution-x.org/device/Pong",
+  "note": "Objeto passageiro pinado: MESMA build nas duas variantes. Nome, URL e sha256 são a identidade do artefato. Nunca trocar por 'mais novo'. Dados oficiais colhidos pela usuária em 2026-11-01.",
+  "install_path": {
+    "official": "recovery + adb sideload (não é fastboot flash de boot)",
+    "gapps": {
+      "recovery_img": "https://cdn.evolution-x.org/Pong/16/recovery/recovery.img",
+      "warning": "recovery.img desta build está com erros — extrair boot.img do zip (payload.bin)",
+      "steps": [
+        "bootloader desbloqueado",
+        "fastboot flash recovery recovery.img",
+        "fastboot reboot recovery",
+        "Factory reset / Format data",
+        "Apply update -> Apply from ADB",
+        "adb sideload <zip>",
+        "reboot system"
+      ]
+    },
+    "vanilla": {
+      "recovery_img": null,
+      "warning": "página oficial: 'No initial images are found for this build' e 'No initial image flashing commands are required'",
+      "steps": [
+        "bootloader desbloqueado",
+        "reboot recovery",
+        "Factory reset / Format data",
+        "Apply update -> Apply from ADB",
+        "adb sideload <zip>",
+        "reboot system"
+      ]
+    }
+  },
+  "variants": [
+    {
+      "id": "vanilla",
+      "label": "Vanilla (sem Google)",
+      "filename": "EvolutionX-16.0-20260915-Pong-11.11-Vanilla-Official.zip",
+      "url": "https://cdn.evolution-x.org/Pong/16_vanilla/EvolutionX-16.0-20260915-Pong-11.11-Vanilla-Official.zip",
+      "size_label": "2.36 GB",
+      "modified": "2026-09-18T03:03:00Z",
+      "md5": "36fa6955fe12a54248342b9490e76963",
+      "sha256": "26be9ac8bb21f0843f369f996d9d905673a140cd25ed2125d12733edf7a687e1",
+      "bytes": null,
+      "status": "pinned_by_user"
+    },
+    {
+      "id": "gapps",
+      "label": "GApps (com Google)",
+      "filename": "EvolutionX-16.0-20260915-Pong-11.11-Official.zip",
+      "url": "https://cdn.evolution-x.org/Pong/16/EvolutionX-16.0-20260915-Pong-11.11-Official.zip",
+      "size_label": "3.4 GB",
+      "modified": "2026-09-18T02:06:00Z",
+      "md5": "e98f1e2f4e06bf3d281fe7ff4ed2375a",
+      "sha256": "79236f9b4259cf5df124dcd7176f8b4c30de0d755e189e8a4224a03e365422fb",
+      "bytes": null,
+      "status": "pinned_by_user"
+    }
+  ]
+}

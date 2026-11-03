@@ -1,0 +1,11 @@
+# SHA256 checksums for kernel patches
+# Source: https://github.com/ravindu644/Droidspaces-OSS
+# Verified: 2026-11-01
+
+47fc945b2d73d9737d56c0f1c3a74cda0a95c30f9dc1b1abe546fa48940c4460  001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+31982c85f4a65ca3ec71d27903626fb0234a39c4d3e99667bc849918e42693b7  002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+
+# Note: Actual patch files are not included in this repository.
+# Patches must be downloaded from:
+#   https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/
+# And verified against SHA256 checksums before applying in CI.

@@ -1,0 +1,139 @@
+{
+  "version": "2.0.0",
+  "legacy_version": "1.0.0",
+  "artifactType": "structured-handoff",
+  "timestamp": "2026-11-03T22:40:30Z",
+  "sessionId": "",
+  "previous_state": {
+    "summary": "Before compaction: 20 recent edit(s)",
+    "session_state": {
+      "state": "initialized"
+    },
+    "plan_counts": {
+      "total": 0,
+      "wip": 0,
+      "blocked": 0,
+      "recent_edits": 20
+    }
+  },
+  "next_action": {
+    "summary": "Re-read Plans.md and determine the next task",
+    "source": "fallback",
+    "priority": "normal"
+  },
+  "open_risks": [
+    {
+      "severity": "medium",
+      "kind": "verification",
+      "summary": "20 recent edit(s) should be re-validated after resume",
+      "detail": ".claude/kpi/.current-user, .claude/kpi/events-camilla.jsonl, .claude/memory/session-log.md, .claude/sessions/.last_inbox_check, .claude/sessions/.last_inbox_read_4ac067f0-1677-4595-8ee6-309ced2be1da"
+    }
+  ],
+  "failed_checks": null,
+  "decision_log": [
+    {
+      "timestamp": "2026-11-03T22:40:30Z",
+      "actor": "pre-compact-save",
+      "decision": "canonical_handoff_artifact_written",
+      "rationale": "Persist a stable JSON artifact in .claude/state for long-running session handoff."
+    },
+    {
+      "timestamp": "2026-11-03T22:40:30Z",
+      "actor": "pre-compact-save",
+      "decision": "legacy_snapshot_mirrored",
+      "rationale": "Keep precompact-snapshot.json for backward compatibility with older hooks."
+    }
+  ],
+  "context_reset": {
+    "policy": {
+      "mode": "auto",
+      "dryRun": false,
+      "thresholds": {
+        "wipTasks": 4,
+        "blockedTasks": 1,
+        "recentEdits": 8,
+        "failedChecks": 1,
+        "sessionAgeMinutes": 120
+      }
+    },
+    "recommended": true,
+    "summary": "Context reset recommended (auto): 20 recent edit count exceed threshold 8",
+    "reasons": [
+      "20 recent edit count exceed threshold 8"
+    ],
+    "candidates": [
+      {
+        "key": "wip_tasks",
+        "label": "WIP task count",
+        "actual": 0,
+        "threshold": 4,
+        "triggered": false
+      },
+      {
+        "key": "blocked_tasks",
+        "label": "blocked task count",
+        "actual": 0,
+        "threshold": 1,
+        "triggered": false
+      },
+      {
+        "key": "recent_edits",
+        "label": "recent edit count",
+        "actual": 20,
+        "threshold": 8,
+        "triggered": true
+      },
+      {
+        "key": "failed_checks",
+        "label": "failed check count",
+        "actual": 0,
+        "threshold": 1,
+        "triggered": false
+      },
+      {
+        "key": "session_age_minutes",
+        "label": "session age (minutes)",
+        "actual": 31,
+        "threshold": 120,
+        "triggered": false
+      }
+    ],
+    "counters": {
+      "wipTasks": 0,
+      "blockedTasks": 0,
+      "recentEdits": 20,
+      "failedChecks": 0,
+      "sessionAgeMinutes": 31
+    }
+  },
+  "continuity": {
+    "plugin_first_workflow": true,
+    "resume_aware_effort_continuity": true,
+    "effort_hint": "medium",
+    "summary": "plugin-first workflow: enabled; resume-aware effort continuity: medium"
+  },
+  "planItems": null,
+  "wipTasks": null,
+  "recentEdits": [
+    ".claude/kpi/.current-user",
+    ".claude/kpi/events-camilla.jsonl",
+    ".claude/memory/session-log.md",
+    ".claude/sessions/.last_inbox_check",
+    ".claude/sessions/.last_inbox_read_4ac067f0-1677-4595-8ee6-309ced2be1da",
+    ".claude/sessions/.last_inbox_read_6d239b12-2869-48b0-9eae-2f13bc488800",
+    ".claude/sessions/.last_inbox_read_7b6c0db0-38bd-46d0-9f0d-64b405fa8d48",
+    ".claude/sessions/.last_inbox_read_8947be4c-9cc6-42eb-aa0f-1fc7dcfbdda5",
+    ".claude/sessions/.last_inbox_read_953997d2-6810-4369-9350-ea6af4713026",
+    ".claude/sessions/.last_inbox_read_d0ed7dd8-e88a-445d-81e3-ecc20e2b52bc",
+    ".claude/sessions/active.json",
+    ".claude/sessions/broadcast.md",
+    ".claude/sessions/leases/107e910e9f2ebfb9a741fa10b2aa7100cc1fc4f5f3aca2dfe78b905cbd73c0d2.lock",
+    ".claude/sessions/leases/2b66a8c1ddee00fb01b65880d0d77fa2f9bba8e1ac5f3c3803ae93bfc5b14e7f.lock",
+    ".claude/sessions/leases/3b1445640016e175ac4726662ebe4a8674f04966d3885c788cd459e7874deb26.lock",
+    ".claude/sessions/leases/497ce4a480e86a135dfa4d5002d0edd4c0274de9d3fd8f8babcb0139ed35e2df.lock",
+    ".claude/sessions/leases/568086d392596514f6dac9ebfc188576475b80982b6d5aa81c4724265ddba510.lock",
+    ".claude/sessions/leases/6c4d91220f1b9494572d45201ecb8b0bd58e8bcd7b5403adaddaea143a889667.lock",
+    ".claude/sessions/leases/7ed336b6c2c42f676ff7f7a641eda9d53645b5117ae5af706b369172fce31acf.lock",
+    ".claude/sessions/leases/86f13567f6863a433b889e8b18d4486868bb1514982ac24a0ed5f45528d31654.lock"
+  ]
+}

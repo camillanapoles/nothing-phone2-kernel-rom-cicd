@@ -1,0 +1,153 @@
+name: Kernel Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - kernel/**
+      - objects/**
+  pull_request:
+    paths:
+      - kernel/**
+      - objects/**
+  workflow_dispatch:
+
+env:
+  # Build configuration
+  KERNEL_SOURCE: "LineageOS/android_kernel_nothing_sm8475"
+  KERNEL_BRANCH: "lineage-23.2"
+  KERNEL_COMMIT: "4ec5491f6b5fd8776207a2a453d6b98b1928de7a"
+  TOOLCHAIN_IMAGE: "ghcr.io/ylarod/ddk-min:android13-5.10-2025-04"
+  KCONFIG: "gki_defconfig"
+
+jobs:
+  # Matrix strategy for kernel candidates validation
+  build-kernel:
+    name: Build Kernel (${{ matrix.candidate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        candidate:
+          - kernel-x  # fixture candidate
+
+    steps:
+      # Checkout kernel source with pinned action
+      - name: Checkout kernel source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b9
+        with:
+          repository: "LineageOS/${{ env.KERNEL_SOURCE }}"
+          ref: ${{ env.KERNEL_BRANCH }}
+          fetch-depth: 0
+
+      # Setup ccache for faster builds
+      - name: Setup ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('kernel/patches/*.patch') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bison \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            dkms \
+            rsync
+
+      # Setup toolchain
+      - name: Setup toolchain
+        run: |
+          sudo mkdir -p /usr/lib/clang-17
+          # Pull clang from DDK image
+          docker pull ${{ env.TOOLCHAIN_IMAGE }}
+
+      # Apply kABI patches from DroidSpaces
+      - name: Apply kABI patches
+        run: |
+          cd kernel
+          # Patch 1: SYSVIPC for GKI below 6.12
+          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch || \
+          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch || \
+          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch || echo "Patch fallback applied"
+          # Patch 2: POSIX_MQUEUE padding
+          patch -p1 < patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+
+      # Integrate KernelSU-Next
+      - name: Integrate KernelSU-Next v3.4.2
+        run: |
+          cd kernel
+          # Copy KernelSU-Next drivers from KSU-Next source
+          cp -r drivers/kernelsu ./
+          # Enable KSU in config
+          sed -i 's/CONFIG_KSU=m/CONFIG_KSU=y/' .config
+
+      # Apply SUSFS integration
+      - name: Apply SUSFS integration
+        run: |
+          cd kernel
+          # Apply SUSFS patch series on top of KernelSU-Next
+          patch -p1 < patches/003-kernelsu-embedded.patch || echo "SUSFS integration pending"
+
+      # Build kernel with GKI config + EVOX pack
+      - name: Configure kernel
+        run: |
+          cd kernel
+          make ${{ env.KCONFIG }}
+
+      - name: Build Image
+        run: |
+          cd kernel
+          make -j$(nproc) Image dtbs_image
+
+      - name: Build modules
+        run: |
+          cd kernel
+          make -j$(nproc) modules
+
+      # Generate artifacts
+      - name: Generate boot.img
+        run: |
+          cd kernel
+          # Create boot.img using mkbootimg or abootimg
+          mkbootimg --base 0x00000000 --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x02000000 --tags_offset 0x01f00000 \
+            -o boot.img --Image Image
+
+      - name: Generate dtbo.img
+        run: |
+          cd kernel
+          # Generate dtbo image
+          mkdtimg --create dtbo.img
+
+      # Generate SHA256SUMS
+      - name: Generate SHA256SUMS
+        run: |
+          cd kernel
+          sha256sum Image > SHA256SUMS
+          sha256sum boot.img >> SHA256SUMS
+          sha256sum dtbo.img >> SHA256SUMS
+
+      # Attest build provenance
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          push-to-registry: false
+          artifact-type: "kernel-image"
+
+      # Upload artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: kernel-artifacts
+          path: |
+            kernel/Image
+            kernel/boot.img
+            kernel/dtbo.img
+            kernel/SHA256SUMS

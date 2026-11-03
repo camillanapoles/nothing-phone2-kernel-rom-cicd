@@ -1,0 +1,6 @@
+{
+  "session_id": "6d239b12-2869-48b0-9eae-2f13bc488800",
+  "holder_pid": 2150330,
+  "acquired_at": 1793742046,
+  "repo_relative_path": "kernel/patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+}

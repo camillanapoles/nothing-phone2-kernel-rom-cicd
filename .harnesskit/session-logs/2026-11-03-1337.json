@@ -1,0 +1,14 @@
+{
+  "sessionId": "2026-11-03-1337",
+  "startedAt": "2026-11-03T16:37:17Z",
+  "endedAt": "2026-11-03T16:37:42Z",
+  "currentFeature": "",
+  "filesChanged": [],
+  "featuresCompleted": [],
+  "featuresFailed": [],
+  "errors": [],
+  "toolCallSequences": [],
+  "rawToolSequence": [],
+  "taskTimeDistribution": {},
+  "pluginUsage": {}
+}
