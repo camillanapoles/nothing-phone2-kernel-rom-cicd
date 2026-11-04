@@ -18,7 +18,7 @@ name: Pong EvoX 11.11 · single fail-closed CI/CD
 
 on:
   push:
-    branches: [main, 'arena/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -235,6 +235,7 @@ jobs:
           key: pong-rom-zip-v1-${{ hashFiles('objects/rom-artifacts.json') }}
 
       - name: Download and verify pinned Vanilla ROM once
+        id: rom_download
         if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true'
         run: |
           set -Eeuo pipefail
@@ -258,9 +259,13 @@ jobs:
             if ! curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
               -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
               -o "$part" "$url" 2>&1 | tee "logs/collect/rom-download-$mode.log"; then
+              echo "::warning::ROM $mode route failed; HTTP metrics are in pong-collection-logs"
               return 1
             fi
-            python3 -c 'import pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); assert zipfile.is_zipfile(p), "download is not a ZIP (possible CDN interstitial)"; z=zipfile.ZipFile(p); assert any(i.filename == "payload.bin" for i in z.infolist()), "payload.bin is absent"' "$part" || return 1
+            python3 -c 'import pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); assert zipfile.is_zipfile(p), "download is not a ZIP (possible CDN interstitial)"; z=zipfile.ZipFile(p); assert any(i.filename == "payload.bin" for i in z.infolist()), "payload.bin is absent"' "$part" || {
+              echo "::warning::ROM $mode route did not return the expected ZIP/payload.bin"
+              return 1
+            }
             printf '%s\n' "$mode" > cache/rom-vanilla/download-mode.txt
           }
           if ! download_rom direct "$ROM_URL"; then
@@ -526,6 +531,28 @@ jobs:
           path: |
             collection-bundle.tar.gz
             collection-bundle.tar.gz.sha256
+
+      - name: Publish sanitized collection failure diagnostics
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          sections = []
+          for path in sorted(pathlib.Path('logs/collect').glob('*.log')):
+              text = path.read_text(errors='replace')
+              text = re.sub(r'(https?://[^\s?]+)\?[^\s]+', r'\1?[REDACTED]', text)
+              text = text.replace('\x1b', '')
+              tail = '\n'.join(text.splitlines()[-12:])
+              if tail:
+                  sections.append(f'### {path.name}\n```text\n{tail[-6000:]}\n```')
+          report = '## Collection failed closed\n\nNo staging, release, flash, or promotion was authorized.\n\n' + ('\n\n'.join(sections) or 'No collection log was created.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(report[:50000] + '\n')
+          print('::error::Collection failed closed; see the run summary and pong-collection-logs')
+          if sections:
+              last = sections[-1].splitlines()[-2].replace('::', ': :')
+              print('::error::Last collection diagnostic: ' + last[-1500:])
+          PY
 
       - name: Upload collection diagnostics even when download fails
         if: always()
