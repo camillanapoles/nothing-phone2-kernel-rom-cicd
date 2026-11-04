@@ -547,7 +547,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pong-collection
-          retention-days: 14
+          # Roughly 51 MiB per run; only downstream jobs in this run need this handoff.
+          retention-days: 1
           if-no-files-found: error
           path: |
             collection-bundle.tar.gz
@@ -1071,6 +1072,8 @@ jobs:
 
       - name: Collect failure diagnostics before Marketplace post cleanup
         if: always()
+        env:
+          MARKETPLACE_BUILD_OUTCOME: ${{ steps.marketplace_build.outcome }}
         run: |
           set +e
           mkdir -p logs/kernel
@@ -1078,6 +1081,26 @@ jobs:
             test ! -f "$path" || cp "$path" "logs/kernel/salvage-$(echo "$path" | tr '/.' '__')"
           done
           git -C kernel-source status --short > logs/kernel/final-source-status.log 2>&1
+          python3 - <<'PY'
+          import os, pathlib, re
+          if os.environ.get('MARKETPLACE_BUILD_OUTCOME') == 'failure':
+              workspace = pathlib.Path(os.environ.get('GITHUB_WORKSPACE', '.')).resolve()
+              def clean(line):
+                  line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line).replace('\r', ' ').strip()
+                  return line.replace(str(workspace), '.')[:900]
+              config = pathlib.Path('kernel-source/out/.config')
+              if config.is_file():
+                  for line in config.read_text(errors='replace').splitlines():
+                      if 'STACKPROTECTOR' in line or line.startswith('CONFIG_LTO_CLANG'):
+                          print(f'::warning::effective kernel config: {clean(line)}')
+              log = pathlib.Path('kernel-source/out/build.log')
+              if log.is_file():
+                  pattern = re.compile(r'ld\.lld: error|undefined symbol|referenced by|error:|failed with exit code', re.I)
+                  selected = [clean(line) for line in log.read_text(errors='replace').splitlines() if pattern.search(line)]
+                  for line in selected[-20:]:
+                      if line:
+                          print(f'::error::kernel build detail: {line}')
+          PY
           exit 0
 
       - name: Upload kernel logs even on failure
@@ -1584,6 +1607,22 @@ jobs:
 
           This is a DRAFT candidate, not a stable release. Verify \`SHA256SUMS\` and attestation before any manual staging operation.
           EOF
+
+      - name: Enforce GitHub release asset limits before drafting
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Each release asset must be strictly below 2 GiB; a release has at most 1000 assets.
+          limit = 2 * 1024**3
+          files = sorted(path for path in Path('candidate').rglob('*') if path.is_file())
+          oversized = [(path.as_posix(), path.stat().st_size) for path in files if path.stat().st_size >= limit]
+          assert len(files) <= 1000, f'Too many release assets: {len(files)}'
+          assert not oversized, f'Assets must use verified external storage instead of GitHub Releases: {oversized}'
+          largest = max((path.stat().st_size for path in files), default=0)
+          print(f'PASS: {len(files)} release assets; largest={largest} bytes; per-file limit={limit - 1} bytes')
+          PY
 
       - name: Publish the draft release candidate
         id: publish
