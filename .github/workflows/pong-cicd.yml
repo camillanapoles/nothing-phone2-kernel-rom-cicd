@@ -242,9 +242,73 @@ jobs:
           path: cache/rom-vanilla
           key: pong-rom-zip-v1-${{ hashFiles('objects/rom-artifacts.json') }}
 
+      - name: Rebuild Vanilla ROM from pinned submodule parts when available
+        id: rom_parts
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          mkdir -p cache/rom-vanilla logs/collect
+          AVAILABLE=false
+          EXPECTED="$(git ls-tree HEAD -- EvolutionX-16.0-Pong | awk '$1 == "160000" {print $3}')"
+          if test -n "$EXPECTED" && test -f .gitmodules; then
+            if git submodule sync -- EvolutionX-16.0-Pong >> logs/collect/rom-parts.log 2>&1 && \
+              git -c protocol.file.allow=never submodule update --init --depth 1 -- EvolutionX-16.0-Pong >> logs/collect/rom-parts.log 2>&1; then
+              ACTUAL="$(git -C EvolutionX-16.0-Pong rev-parse HEAD)"
+              if test "$ACTUAL" != "$EXPECTED"; then
+                echo "::error::ROM parts submodule commit mismatch: expected $EXPECTED, got $ACTUAL"
+                exit 1
+              fi
+              SUBMODULE_EXPECTED="$EXPECTED" python3 - <<'PY'
+          import hashlib, json, os, pathlib, zipfile
+          root = pathlib.Path('EvolutionX-16.0-Pong')
+          parts = sorted((p for p in root.iterdir() if p.name.startswith('evo_part_') and p.is_file() and not p.is_symlink()), key=lambda p: p.name)
+          assert parts, 'submodule is accessible but contains no evo_part_* regular files'
+          rom = json.load(open('objects/rom-artifacts.json'))
+          vanilla = next(x for x in rom['variants'] if x['id'] == 'vanilla')
+          output = pathlib.Path('cache/rom-vanilla') / (vanilla['filename'] + '.part')
+          final = output.with_suffix('')
+          digest = hashlib.sha256()
+          report_parts = []
+          with output.open('wb') as target:
+              for part in parts:
+                  part_digest = hashlib.sha256()
+                  size = 0
+                  with part.open('rb') as source:
+                      while block := source.read(1024 * 1024):
+                          target.write(block)
+                          digest.update(block)
+                          part_digest.update(block)
+                          size += len(block)
+                  assert size > 0, f'empty ROM part: {part.name}'
+                  report_parts.append({'filename': part.name, 'bytes': size, 'sha256': part_digest.hexdigest()})
+          actual = digest.hexdigest()
+          is_zip = zipfile.is_zipfile(output)
+          payload_present = is_zip and any(item.filename == 'payload.bin' for item in zipfile.ZipFile(output).infolist())
+          report = {
+              'schema': 'pong-rom-parts/1', 'submodule_commit': os.environ['SUBMODULE_EXPECTED'],
+              'parts': report_parts, 'bytes': output.stat().st_size,
+              'expected_sha256': vanilla['sha256'], 'actual_sha256': actual,
+              'zip_valid': is_zip, 'payload_bin_present': payload_present,
+              'status': 'VERIFIED' if actual == vanilla['sha256'] and is_zip and payload_present else 'REJECTED',
+          }
+          pathlib.Path('logs/collect/rom-parts.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          if report['status'] != 'VERIFIED':
+              output.unlink(missing_ok=True)
+              raise SystemExit(f"ROM parts rejected: {json.dumps({k: report[k] for k in ('expected_sha256', 'actual_sha256', 'zip_valid', 'payload_bin_present')})}")
+          pathlib.Path('cache/rom-vanilla/download-mode.txt').write_text('parts\n')
+          os.replace(output, final)
+          print(f"Verified {len(parts)} ROM parts at submodule {os.environ['SUBMODULE_EXPECTED']}")
+          PY
+              AVAILABLE=true
+            else
+              echo '::warning::Pinned ROM parts submodule is unavailable; trying the other verified ROM transports.'
+            fi
+          fi
+          echo "available=$AVAILABLE" >> "$GITHUB_OUTPUT"
+
       - name: Download and verify pinned Vanilla ROM once
         id: rom_download
-        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true'
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true' && steps.rom_parts.outputs.available != 'true'
         run: |
           set -Eeuo pipefail
           mkdir -p cache/rom-vanilla logs/collect
