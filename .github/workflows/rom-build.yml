@@ -155,7 +155,13 @@ PY
             **Source:** Evolution X official CDN
 
             ## Installation (Slot A only)
-            See `INSTALL-SEQUENCE.md` for complete installation procedure.
+            This release is for Slot A only. Follow `INSTALL-SEQUENCE.md` for the complete Slot A installation procedure.
+
+            **F1 Base Flash:** `fastboot flash --slot=a firmware.bin` + `fastboot flash --slot=a boot` + sideload EvolutionX Vanilla
+            **F3 Root:** `fastboot flash boot_a boot-ksu.img` + verify `su -c id` returns uid=0
+            **F5 Integrity:** PIFork + TEESimulator-RS Enhanced + keybox.xml
+            **F6 Apps:** CircleToSearch (e4f4614), Morphe v2.3.0, Gemini
+            **F7 Performance:** Universal GMS Doze 1.9.11
           files: |
             ${{ steps.download_rom.outputs.filename }}
             SHA256SUMS

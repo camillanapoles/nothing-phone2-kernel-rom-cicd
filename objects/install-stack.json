@@ -1,22 +1,22 @@
 {
   "stack_name": "nothing-phone2-kernel-rom-cicd",
   "layers": {
-    "1": {"name": "source_control", "type": "git", "required": true},
-    "2": {"name": "build_toolchain", "type": "clang", "version": "r530567", "required": true},
-    "3": {"name": "kernel_source", "type": "lineageos", "repo": "LineageOS/android_kernel_nothing_sm8475", "commit": "4ec5491f6b5f", "required": true},
-    "4": {"name": "rom_source", "type": "evolution_x", "repo": "EvolutionXMobile/android_packages_apps_EvolutionX", "commit": "26be9ac8bb21", "required": true},
-    "5": {"name": "gapps_source", "type": "open_gapps", "commit": "79236f9b4259", "required": false},
-    "6": {"name": "kernel_patches", "type": "droidspaces_kabi", "patches": ["001-kabi-sysvipc", "002-mqueue-padding"], "required": true},
-    "7": {"name": "kernel_su", "type": "kernelsu", "version": "v3.4.2-next", "embedded": true},
-    "8": {"name": "susfs_module", "type": "susfs", "version": "R28", "required": true},
-    "9": {"name": "gki_config", "type": "gki_defconfig", "base": "common", "required": true},
-    "10": {"name": "device_config", "type": "evox_pong_pack", "required": true},
-    "11": {"name": "ccache", "type": "ccache_persistence", "required": true},
-    "12": {"name": "build_verification", "type": "sha256_manifest", "required": true},
-    "13": {"name": "provenance_attestation", "type": "attest", "source": "actions/attest-build-provenance", "required": true},
-    "14": {"name": "artifact_packaging", "type": "anykernel3", "required": true},
-    "15": {"name": "release_publishing", "type": "github_release", "draft": true, "required": true},
-    "16": {"name": "slot_a_deployment", "type": "fastboot_single_slot", "required": true}
+    "1": {"id": "source_control", "name": "source_control", "type": "git", "pin": "commit:source-repo", "required": true},
+    "2": {"id": "build_toolchain", "name": "build_toolchain", "type": "clang", "pin": "pkg:clang-r530567", "version": "r530567", "required": true},
+    "3": {"id": "kernel_source", "name": "kernel_source", "type": "lineageos", "pin": "commit:4ec5491f6b5fd8776207a2a453d6b98b1928de7a", "repo": "LineageOS/android_kernel_nothing_sm8475", "commit": "4ec5491f6b5f", "required": true},
+    "4": {"id": "rom_source", "name": "rom_source", "type": "evolution_x", "pin": "commit:26be9ac8bb21", "repo": "EvolutionXMobile/android_packages_apps_EvolutionX", "commit": "26be9ac8bb21", "required": true},
+    "5": {"id": "gapps_source", "name": "gapps_source", "type": "open_gapps", "pin": "tag:79236f9b4259", "commit": "79236f9b4259", "required": false},
+    "6": {"id": "kernel_patches", "name": "kernel_patches", "type": "droidspaces_kabi", "pin": "pkg:droidspaces-kabi", "patches": ["001-kabi-sysvipc", "002-mqueue-padding"], "required": true},
+    "7": {"id": "kernel_su", "name": "kernel_su", "type": "kernelsu", "pin": "tag:v3.4.2-next", "embedded": true, "required": true},
+    "8": {"id": "susfs_module", "name": "susfs_module", "type": "susfs", "pin": "tag:R28", "required": true},
+    "9": {"id": "gki_config", "name": "gki_config", "type": "gki_defconfig", "pin": "pkg:gki-config", "base": "common", "required": true},
+    "10": {"id": "device_config", "name": "device_config", "type": "evox_pong_pack", "pin": "pkg:evox-pong-pack", "required": true},
+    "11": {"id": "ccache", "name": "ccache", "type": "ccache_persistence", "pin": "pkg:ccache-persistence", "required": true},
+    "12": {"id": "build_verification", "name": "build_verification", "type": "sha256_manifest", "pin": "pkg:build-verification", "required": true},
+    "13": {"id": "provenance_attestation", "name": "provenance_attestation", "type": "attest", "pin": "pkg:attest-build-provenance", "source": "actions/attest-build-provenance", "required": true},
+    "14": {"id": "artifact_packaging", "name": "artifact_packaging", "type": "anykernel3", "pin": "pkg:anykernel3-zip", "required": true},
+    "15": {"id": "release_publishing", "name": "release_publishing", "type": "github_release", "pin": "pkg:github-release", "draft": true, "required": true},
+    "16": {"id": "slot_a_deployment", "name": "slot_a_deployment", "type": "fastboot_single_slot", "pin": "pkg:fastboot-single-slot", "required": true}
   },
   "invariants": [
     {
