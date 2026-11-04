@@ -2,3 +2,8 @@
 # AI assistant artifacts
 context-snapshot.json
 state.md
+
+# Temporary guided intake: uploaded binaries, candidates, partial uploads and token
+.intake/
+__pycache__/
+*.pyc
