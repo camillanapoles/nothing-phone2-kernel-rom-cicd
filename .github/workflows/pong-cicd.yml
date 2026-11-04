@@ -17,6 +17,8 @@
 name: Pong EvoX 11.11 · single fail-closed CI/CD
 
 on:
+  push:
+    branches: [main, 'arena/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
