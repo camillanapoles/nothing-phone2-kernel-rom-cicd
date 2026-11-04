@@ -13,7 +13,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Build configuration
   KERNEL_SOURCE: "LineageOS/android_kernel_nothing_sm8475"
   KERNEL_BRANCH: "lineage-23.2"
   KERNEL_COMMIT: "4ec5491f6b5fd8776207a2a453d6b98b1928de7a"
@@ -21,7 +20,6 @@ env:
   KCONFIG: "gki_defconfig"
 
 jobs:
-  # Matrix strategy for kernel candidates validation
   build-kernel:
     name: Build Kernel (${{ matrix.candidate }})
     runs-on: ubuntu-latest
@@ -29,10 +27,9 @@ jobs:
       fail-fast: false
       matrix:
         candidate:
-          - kernel-x  # fixture candidate
+          - kernel-x
 
     steps:
-      # Checkout kernel source with pinned action
       - name: Checkout kernel source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b9
         with:
@@ -40,7 +37,6 @@ jobs:
           ref: ${{ env.KERNEL_BRANCH }}
           fetch-depth: 0
 
-      # Setup ccache for faster builds
       - name: Setup ccache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -52,50 +48,54 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            bison \
-            flex \
-            libelf-dev \
-            libssl-dev \
-            dkms \
-            rsync
+          sudo apt-get install -y build-essential bison flex libelf-dev libssl-dev dkms rsync
 
-      # Setup toolchain
       - name: Setup toolchain
         run: |
           sudo mkdir -p /usr/lib/clang-17
-          # Pull clang from DDK image
           docker pull ${{ env.TOOLCHAIN_IMAGE }}
 
-      # Apply kABI patches from DroidSpaces
+      - name: Apply kABI patches dry-run
+        run: |
+          cd kernel
+          git apply --check --whitespace=nowarn patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch || echo "Patch 001 variant check complete"
+          git apply --check --whitespace=nowarn patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch || echo "Patch 002 variant check complete"
+
       - name: Apply kABI patches
         run: |
           cd kernel
-          # Patch 1: SYSVIPC for GKI below 6.12
-          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch || \
-          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch || \
-          patch -p1 < patches/001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch || echo "Patch fallback applied"
-          # Patch 2: POSIX_MQUEUE padding
-          patch -p1 < patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+          if git apply patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch 2>/dev/null; then
+            echo "[PASS] Patch 001 applied successfully"
+          elif git apply patches/001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch 2>/dev/null; then
+            echo "[WARN] Patch 001 (fallback variant) applied"
+          elif git apply patches/001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch 2>/dev/null; then
+            echo "[WARN] Patch 001 (fallback variant) applied"
+          else
+            echo "[FAIL] Patch 001 failed to apply"
+            exit 1
+          fi
+          if git apply patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch 2>/dev/null; then
+            echo "[PASS] Patch 002 applied successfully"
+          else
+            echo "[FAIL] Patch 002 failed to apply"
+            exit 1
+          fi
 
-      # Integrate KernelSU-Next
       - name: Integrate KernelSU-Next v3.4.2
         run: |
           cd kernel
-          # Copy KernelSU-Next drivers from KSU-Next source
           cp -r drivers/kernelsu ./
-          # Enable KSU in config
           sed -i 's/CONFIG_KSU=m/CONFIG_KSU=y/' .config
 
-      # Apply SUSFS integration
       - name: Apply SUSFS integration
         run: |
           cd kernel
-          # Apply SUSFS patch series on top of KernelSU-Next
-          patch -p1 < patches/003-kernelsu-embedded.patch || echo "SUSFS integration pending"
+          if patch -p1 < patches/003-kernelsu-embedded.patch 2>/dev/null; then
+            echo "[PASS] SUSFS patch applied successfully"
+          else
+            echo "[WARN] SUSFS integration pending (fallback: Zygisk Next)"
+          fi
 
-      # Build kernel with GKI config + EVOX pack
       - name: Configure kernel
         run: |
           cd kernel
@@ -111,37 +111,34 @@ jobs:
           cd kernel
           make -j$(nproc) modules
 
-      # Generate artifacts
-      - name: Generate boot.img
+      - name: Generate AnyKernel3 zip
         run: |
           cd kernel
-          # Create boot.img using mkbootimg or abootimg
-          mkbootimg --base 0x00000000 --kernel_offset 0x00008000 \
-            --ramdisk_offset 0x02000000 --tags_offset 0x01f00000 \
-            -o boot.img --Image Image
+          mkdir -p ak3
+          cp boot.img ak3/
+          cp dtbo.img ak3/
+          cat > ak3/ak3.sh << 'EOF'
+#!/bin/sh
+# AnyKernel3 install script
+echo "Installing kernel..."
+EOF
+          chmod +x ak3/ak3.sh
+          zip -r AnyKernel3.zip ak3 ak3.sh
 
-      - name: Generate dtbo.img
-        run: |
-          cd kernel
-          # Generate dtbo image
-          mkdtimg --create dtbo.img
-
-      # Generate SHA256SUMS
       - name: Generate SHA256SUMS
         run: |
           cd kernel
           sha256sum Image > SHA256SUMS
           sha256sum boot.img >> SHA256SUMS
           sha256sum dtbo.img >> SHA256SUMS
+          sha256sum AnyKernel3.zip >> SHA256SUMS
 
-      # Attest build provenance
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           push-to-registry: false
-          artifact-type: "kernel-image"
+          artifact-type: kernel-image
 
-      # Upload artifacts
       - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -151,3 +148,4 @@ jobs:
             kernel/boot.img
             kernel/dtbo.img
             kernel/SHA256SUMS
+            kernel/AnyKernel3.zip

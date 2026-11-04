@@ -55,42 +55,42 @@ tricky-store · mindthegapps · microg · chrome · velvet · wellbeing.
 
 | # | Ação | PASS |
 |---|---|---|
-| 0.1 | E03: árvore pinada + build do kernel | 7 artefatos + sha256 conferido |
-| 0.2 | baixar firmware B4.0-251119-1654 | versão e hash registrados |
-| 0.3 | baixar ROM vanilla + NikGapps Core | hash das duas variantes conferido |
+| 0.1 | Download artifacts + verify SHA256 | `make -s prove` exit 0 |
+| 0.2 | Verify firmware B4.0-251119-1654 | versão e hash registrados |
+| 0.3 | Verify ROM vanilla + NikGapps Core | hash das duas variantes conferido |
 | 0.4 | baixar 6 zips de módulo + 4 APKs | todo item com versão pinada e sha256 |
 | 0.5 | backup do `boot.img` stock + ADB/fastboot | `fastboot devices` responde + `.sha256` |
 | 0.6 | gates do repo verdes | `make -s prove` e `make -s arch` = 0 |
 
-## F1 · Base do sistema (mesma sessão de recovery)
+## F1 · Base do sistema (Slot A only, mesma sessão de recovery)
 
 | # | Ação | PASS |
 |---|---|---|
-| 1.1 | flash do firmware nos dois slots | base atualizada no About |
+| 1.1 | `fastboot flash --slot=a firmware.bin` | base atualizada no About (Slot A) |
 | 1.2 | **format data** (não dirty flash) | storage limpo |
-| 1.3 | flash da ROM vanilla | About mostra 11.11 |
-| 1.4 | flash do NikGapps Core **sem reboot no meio** | Play Store presente e excluídos ausentes |
-| 1.5 | reboot | primeiro boot sem loop |
+| 1.3 | `fastboot flash --slot=a boot` + sideload EvolutionX Vanilla | About mostra 11.11 (Slot A) |
+| 1.4 | flash do NikGapps Core **sem reboot no meio** (Slot A) | Play Store presente e excluídos ausentes |
+| 1.5 | reboot | primeiro boot sem loop (Slot A) |
 
-## F2 · Saneamento do primeiro boot
+## F2 · Saneamento do primeiro boot (Slot A)
 
 | # | Ação | PASS |
 |---|---|---|
-| 2.1 | setup **sem restaurar backup** | nenhum app restaurado |
+| 2.1 | setup **sem restaurar backup** (Slot A) | nenhum app restaurado |
 | 2.2 | auto-update do Play **off** | toggle desligado |
 | 2.3 | auto-sync e scan do Play Protect **off** | ambos off |
 | 2.4 | conferir WebView AOSP | `dumpsys webviewupdate` com provider válido |
 | 2.5 | congelar OTA até o fim do ciclo | updater sem download em fila |
 
-## F3 · Root
+## F3 · Root (Slot A)
 
 | # | Ação | PASS |
 |---|---|---|
-| 3.1 | flash do `boot.img` com KSU-Next LKM | `su -c id` = uid 0 |
+| 3.1 | `fastboot flash boot_a boot-ksu.img` (Slot A) | `su -c id` returns uid=0 |
 | 3.2 | instalar manager do KSU-Next | manager concede root |
 | 3.3 | backup do boot já com root | arquivo e hash guardados |
 
-## F4 · Ocultação de Root (um por reboot)
+## F4 · Ocultação de Root (Slot A, um por reboot)
 
 | # | Ação | PASS |
 |---|---|---|
@@ -106,11 +106,11 @@ tricky-store · mindthegapps · microg · chrome · velvet · wellbeing.
 > **paths, mounts, kstat e uname** no kernel. Sem ele, apps que varrem o kernel continuam
 > detectando — e o custo é ~zero (sem daemon).
 
-## F5 · Integridade (um por reboot)
+## F5 · Integridade (Slot A, um por reboot)
 
 | # | Ação | PASS |
 |---|---|---|
-| 5.1 | PlayIntegrityFork | BASIC verde |
+| 5.1 | PlayIntegrityFork | BASIC verde (Slot A) |
 | 5.2 | TEESimulator-RS Enhanced | engine carregada, `keystore2` interceptado |
 | 5.3 | `keybox.xml` não revogada | status não revogado — **revogada = PENDENTE exit 3** |
 | 5.4 | `target.txt` com `com.android.vending` + apps de One/Workspace | apps listados |
@@ -119,11 +119,11 @@ tricky-store · mindthegapps · microg · chrome · velvet · wellbeing.
 | 5.7 | checker de integridade | DEVICE verde (STRONG só se necessário) |
 | 5.8 | app real de One/Workspace | abre e autentica |
 
-## F6 · Apps
+## F6 · Apps & Features (Slot A)
 
 | # | App | PASS |
 |---|---|---|
-| 6.1 | Gemini | loga e responde |
+| 6.1 | Gemini | loga e responde (Slot A) |
 | 6.2 | Drive (se mantido) | sync de um arquivo ok |
 | 6.3 | CircleToSearch @ `e4f4614` | os 7 critérios (abaixo) |
 | 6.4 | Morphe v2.3.0 + YouTube patcheado + detach | sem ads e update do Play não sobrescreve |
@@ -133,11 +133,11 @@ tricky-store · mindthegapps · microg · chrome · velvet · wellbeing.
 cópia de texto **com rede desligada** · **tradução presente no commit pinado** (se não → PENDENTE) ·
 nenhuma notificação persistente.
 
-## F7 · Performance e bateria
+## F7 · Performance e bateria (Slot A)
 
 | # | Ação | PASS |
 |---|---|---|
-| 7.1 | Universal GMS Doze 1.9.11 | GMS otimizável e FCM intacto |
+| 7.1 | Universal GMS Doze 1.9.11 (Slot A) | GMS otimizável e FCM intacto |
 | 7.2 | restringir background de Drive/Gemini; Find My Device off | apps restritos sem perder notificação |
 | 7.3 | baseline de idle noturno e RAM | drain alvo e OTP chegando |
 
