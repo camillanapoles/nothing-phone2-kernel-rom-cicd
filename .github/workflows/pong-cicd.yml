@@ -23,6 +23,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      rom_mirror_url:
+        description: Optional HTTPS mirror of the exact pinned Vanilla ZIP; canonical SHA256 is still enforced
+        required: false
+        default: ""
+        type: string
       run_device_tests:
         description: Run read-only smoke on an already staged self-hosted Pong
         required: true
@@ -53,6 +58,9 @@ permissions:
   contents: read
 
 env:
+  # A repository variable with the same name can be used for PR validation.
+  # This is only a transport alternative; objects/rom-artifacts.json remains authoritative.
+  ROM_MIRROR_URL: ${{ inputs.rom_mirror_url || vars.PONG_ROM_MIRROR_URL }}
   KERNEL_COMMIT: 4ec5491f6b5fd8776207a2a453d6b98b1928de7a
   KSU_COMMIT: 4c706b5938665866ebe16944a481a7b91e3396af
   KSU_VERSION: v3.4.2
@@ -256,7 +264,7 @@ jobs:
           download_rom() {
             local mode="$1" url="$2" part="cache/rom-vanilla/$ROM_FILENAME.part"
             rm -f "$part"
-            if ! curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+            if ! curl -fL --retry 5 --retry-delay 10 --connect-timeout 30 \
               -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
               -o "$part" "$url" 2>&1 | tee "logs/collect/rom-download-$mode.log"; then
               echo "::warning::ROM $mode route failed; HTTP metrics are in pong-collection-logs"
@@ -268,14 +276,27 @@ jobs:
             }
             printf '%s\n' "$mode" > cache/rom-vanilla/download-mode.txt
           }
-          if ! download_rom direct "$ROM_URL"; then
+          ROM_OK=0
+          if download_rom direct "$ROM_URL"; then
+            ROM_OK=1
+          else
             case "$ROM_URL" in
               */download) PROXY_URL="${ROM_URL%/download}/proxy-download" ;;
               *) PROXY_URL="$ROM_URL" ;;
             esac
-            if test "$PROXY_URL" = "$ROM_URL"; then exit 1; fi
-            echo 'Direct R2 route failed; trying the official CDN proxy fallback for the same object.'
-            download_rom proxy "$PROXY_URL"
+            if test "$PROXY_URL" != "$ROM_URL"; then
+              echo 'Direct R2 route failed; trying the official CDN proxy fallback for the same object.'
+              if download_rom proxy "$PROXY_URL"; then ROM_OK=1; fi
+            fi
+          fi
+          if test "$ROM_OK" = 0 && test -n "${ROM_MIRROR_URL:-}"; then
+            python3 -c 'import sys,urllib.parse; u=urllib.parse.urlsplit(sys.argv[1]); assert len(sys.argv[1]) <= 4096 and u.scheme == "https" and u.hostname and not u.username and not u.password, "ROM mirror must be HTTPS without embedded credentials"' "$ROM_MIRROR_URL"
+            echo 'Official routes failed; trying the explicitly supplied mirror of the same pinned object.'
+            if download_rom mirror "$ROM_MIRROR_URL"; then ROM_OK=1; fi
+          fi
+          if test "$ROM_OK" = 0; then
+            echo '::error::All configured ROM transports failed; supply a verified HTTPS mirror or keep the collection blocked.'
+            exit 1
           fi
           echo "$ROM_SHA256  cache/rom-vanilla/$ROM_FILENAME.part" | sha256sum -c -
           mv "cache/rom-vanilla/$ROM_FILENAME.part" "cache/rom-vanilla/$ROM_FILENAME"
