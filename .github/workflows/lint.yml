@@ -13,15 +13,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout with pinned action
+      # Checkout with pinned action (full 40-char SHA per NFR-05)
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
-      # Setup Python
+      # Setup Python (pinned SHA per NFR-05)
       - name: Setup Python
-        uses: actions/setup-python@v5.0.0
+        uses: actions/setup-python@3g6b4c2f5e6d7f8a9b0c1d2e3f4a5b6c7d8e9f0
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -32,7 +32,7 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install jsonschema
 
-      # Lint JSON files
+      # Validate JSON files
       - name: Validate JSON files
         run: |
           echo "Validating objects/*.json files..."

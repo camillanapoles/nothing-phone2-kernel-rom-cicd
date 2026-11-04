@@ -1,27 +1,11 @@
-# Code owners for Nothing Phone 2 CI/CD Pipeline
+# CODEOWNERS - Nothing Phone 2 Kernel/ROM CI/CD
 
-# Kernel build workflows
-.github/workflows/kernel-build.yml        @mechanical-coder @android-architect
+# Primary maintainers (must approve all changes)
+@mechanical-coder Primary maintainer
+@android-architect Architecture review
+@security-reviewer Security validation
 
-# Stack governance
-.github/workflows/stack-governance.yml   @mechanical-coder @security-reviewer
-
-# Object definitions (source of truth)
-objects/*.json                              @mechanical-coder
-
-# Validation scripts
-scripts/stack_gate.py                       @mechanical-coder
-scripts/kernel_build_gate.py                @mechanical-coder
-
-# Kernel configuration and patches
-kernel/configs/*.config                     @mechanical-coder
-kernel/patches/*.patch                      @mechanical-coder
-
-# Installation sequence
-INSTALL-SEQUENCE.md                         @mechanical-coder
-
-# Catch-all for kernel directory
-kernel/**                                   @mechanical-coder
-
-# Documentation
-*.md                                      @mechanical-coder @documentation-writer
+# PR requirements
+# - All changes require at least 1 approval from primary maintainers
+# - All PRs must pass CI validation (stack invariants, kernel build plan)
+# - Modified kernel sources must be published with binaries (GPL-2.0)
