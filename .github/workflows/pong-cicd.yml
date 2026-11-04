@@ -727,7 +727,8 @@ jobs:
         timeout-minutes: 95
         uses: dabao1955/kernel_build_action@c61fc39e72624a641caf23b71660aa4de2bff036
         with:
-          kernel-url: ./kernel-source
+          # The pinned action recognizes local paths only when they end in '/'.
+          kernel-url: ./kernel-source/
           config: pong_${{ needs.stack-governance.outputs.kernel_fingerprint }}_defconfig
           arch: arm64
           aosp-clang: false
