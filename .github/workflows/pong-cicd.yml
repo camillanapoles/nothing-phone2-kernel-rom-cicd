@@ -45,7 +45,8 @@ on:
         type: string
 
 concurrency:
-  group: pong-cicd-${{ github.ref }}
+  # A push and its PR synchronize event for one head SHA share one queue.
+  group: pong-cicd-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -144,8 +145,11 @@ jobs:
           kernel_identity = {
               'schema': 'pong-kernel-inputs/1',
               'source': plan['source']['pin'],
+              'source_pin_date': plan['source']['pin_date'],
               'ksu': os.environ['KSU_COMMIT'],
               'susfs_mode': 'KernelSU-Next-v3.4.2-SUSFS-LKM-2.3.0-gki',
+              'build_environment': {name: os.environ[name] for name in ('KBUILD_BUILD_USER', 'KBUILD_BUILD_HOST', 'KBUILD_BUILD_VERSION', 'LLVM', 'LLVM_IAS')},
+              'build_recipe_sha256': hashlib.sha256((root / '.github/workflows/pong-cicd.yml').read_bytes()).hexdigest(),
               'clang_archive': os.environ['CLANG_ARCHIVE_URL'],
               'gcc64': 'aarch64-linux-android-4.9@android-12.1.0_r27',
               'gcc32': 'arm-linux-androideabi-4.9@android-12.1.0_r27',
@@ -239,13 +243,24 @@ jobs:
           import json, shlex
           rom = json.load(open('objects/rom-artifacts.json'))
           v = next(x for x in rom['variants'] if x['id'] == 'vanilla')
-          print('ROM_URL=' + shlex.quote(v['url']))
+          # The official device page links the same pinned filename through /download;
+          # the bare CDN path is an interstitial and is not a ROM byte stream.
+          download_url = v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url']
+          print('ROM_URL=' + shlex.quote(download_url))
+          print('ROM_SOURCE_URL=' + shlex.quote(v['url']))
           print('ROM_SHA256=' + shlex.quote(v['sha256']))
           print('ROM_FILENAME=' + shlex.quote(v['filename']))
           PY
           . cache/rom-vanilla/download.env
           curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+            -D logs/collect/rom-response-headers.log -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
             -o "cache/rom-vanilla/$ROM_FILENAME.part" "$ROM_URL" 2>&1 | tee logs/collect/rom-download.log
+          python3 - <<'PY'
+          import pathlib, zipfile
+          path = next(pathlib.Path('cache/rom-vanilla').glob('*.part'))
+          assert zipfile.is_zipfile(path), f'download is not a ZIP (possible CDN interstitial): {path}'
+          assert any(item.filename == 'payload.bin' for item in zipfile.ZipFile(path).infolist()), 'payload.bin is absent'
+          PY
           echo "$ROM_SHA256  cache/rom-vanilla/$ROM_FILENAME.part" | sha256sum -c -
           mv "cache/rom-vanilla/$ROM_FILENAME.part" "cache/rom-vanilla/$ROM_FILENAME"
 
@@ -331,7 +346,7 @@ jobs:
           partitions = (root / 'payload-partitions.log').read_text()
           manifest = {
               'schema': 'pong-rom-assets/1', 'status': 'VERIFIED',
-              'rom': {'url': v['url'], 'filename': v['filename'], 'sha256': v['sha256']},
+              'rom': {'url': v['url'], 'download_url': v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'filename': v['filename'], 'sha256': v['sha256']},
               'payload_dumper_commit': os.environ['PAYLOAD_DUMPER_COMMIT'],
               'boot_header_version': header_version,
               'init_boot_present': 'init_boot' in partitions,
