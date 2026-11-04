@@ -252,15 +252,26 @@ jobs:
           print('ROM_FILENAME=' + shlex.quote(v['filename']))
           PY
           . cache/rom-vanilla/download.env
-          curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
-            -D logs/collect/rom-response-headers.log -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
-            -o "cache/rom-vanilla/$ROM_FILENAME.part" "$ROM_URL" 2>&1 | tee logs/collect/rom-download.log
-          python3 - <<'PY'
-          import pathlib, zipfile
-          path = next(pathlib.Path('cache/rom-vanilla').glob('*.part'))
-          assert zipfile.is_zipfile(path), f'download is not a ZIP (possible CDN interstitial): {path}'
-          assert any(item.filename == 'payload.bin' for item in zipfile.ZipFile(path).infolist()), 'payload.bin is absent'
-          PY
+          download_rom() {
+            local mode="$1" url="$2" part="cache/rom-vanilla/$ROM_FILENAME.part"
+            rm -f "$part"
+            if ! curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+              -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
+              -o "$part" "$url" 2>&1 | tee "logs/collect/rom-download-$mode.log"; then
+              return 1
+            fi
+            python3 -c 'import pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); assert zipfile.is_zipfile(p), "download is not a ZIP (possible CDN interstitial)"; z=zipfile.ZipFile(p); assert any(i.filename == "payload.bin" for i in z.infolist()), "payload.bin is absent"' "$part" || return 1
+            printf '%s\n' "$mode" > cache/rom-vanilla/download-mode.txt
+          }
+          if ! download_rom direct "$ROM_URL"; then
+            case "$ROM_URL" in
+              */download) PROXY_URL="${ROM_URL%/download}/proxy-download" ;;
+              *) PROXY_URL="$ROM_URL" ;;
+            esac
+            if test "$PROXY_URL" = "$ROM_URL"; then exit 1; fi
+            echo 'Direct R2 route failed; trying the official CDN proxy fallback for the same object.'
+            download_rom proxy "$PROXY_URL"
+          fi
           echo "$ROM_SHA256  cache/rom-vanilla/$ROM_FILENAME.part" | sha256sum -c -
           mv "cache/rom-vanilla/$ROM_FILENAME.part" "cache/rom-vanilla/$ROM_FILENAME"
 
@@ -346,7 +357,7 @@ jobs:
           partitions = (root / 'payload-partitions.log').read_text()
           manifest = {
               'schema': 'pong-rom-assets/1', 'status': 'VERIFIED',
-              'rom': {'url': v['url'], 'download_url': v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'filename': v['filename'], 'sha256': v['sha256']},
+              'rom': {'url': v['url'], 'download_url': v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'proxy_download_url': v['url'] + '/proxy-download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'download_mode': pathlib.Path('cache/rom-vanilla/download-mode.txt').read_text().strip() if pathlib.Path('cache/rom-vanilla/download-mode.txt').is_file() else 'restored-extraction-cache', 'filename': v['filename'], 'sha256': v['sha256']},
               'payload_dumper_commit': os.environ['PAYLOAD_DUMPER_COMMIT'],
               'boot_header_version': header_version,
               'init_boot_present': 'init_boot' in partitions,
@@ -515,6 +526,15 @@ jobs:
           path: |
             collection-bundle.tar.gz
             collection-bundle.tar.gz.sha256
+
+      - name: Upload collection diagnostics even when download fails
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-collection-logs
+          retention-days: 14
+          if-no-files-found: warn
+          path: logs/collect
 
   kernel-build:
     name: kernel-build · KSU-Next + SUSFS LKM + reproducibility
