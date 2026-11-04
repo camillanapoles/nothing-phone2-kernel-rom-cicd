@@ -50,9 +50,9 @@ on:
         type: string
 
 concurrency:
-  # A push and its PR synchronize event for one head SHA share one queue.
+  # Head-SHA groups isolate revisions; never throw away a long kernel build on a duplicate event.
   group: pong-cicd-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -163,6 +163,7 @@ jobs:
               'gcc32': 'arm-linux-androideabi-4.9@android-12.1.0_r27',
               'action': os.environ['KERNEL_ACTION_COMMIT'],
               'defconfig': plan['build']['defconfig'],
+              'lto_mode': plan['build']['lto'],
               'vendor_fragments': plan['build']['fragments'][:-1],
               'config_contract': plan['configs'],
               'file_sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in files},
@@ -690,7 +691,10 @@ jobs:
                   not_applicable[name] = 'Replaced by the separately built and runtime-tested SUSFS 2.3.0-gki LKM.'
               else:
                   required.append(name)
-          required += ['CONFIG_MODULES', 'CONFIG_MODULE_UNLOAD', 'CONFIG_KPROBES', 'CONFIG_LTO_CLANG_THIN']
+          lto_mode = plan['build']['lto']
+          lto_configs = {'full': 'CONFIG_LTO_CLANG_FULL', 'thin': 'CONFIG_LTO_CLANG_THIN'}
+          assert lto_mode in lto_configs, f'Unsupported reviewed LTO mode: {lto_mode}'
+          required += ['CONFIG_MODULES', 'CONFIG_MODULE_UNLOAD', 'CONFIG_KPROBES', 'CONFIG_CFI_CLANG', lto_configs[lto_mode]]
           required = sorted(set(required))
           target = pathlib.Path('kernel-source/arch/arm64/configs/evox_pong_pack_ci.config')
           target.write_text('# Generated from objects/kernel-build-plan.json; see kernel-config-expectations.json\n' + ''.join(f'{name}=y\n' for name in required))
@@ -699,7 +703,7 @@ jobs:
           unique_defconfig = pathlib.Path('kernel-source/arch/arm64/configs') / f'pong_{__import__("os").environ["KERNEL_FINGERPRINT"]}_defconfig'
           unique_defconfig.write_bytes(pathlib.Path('kernel-source/arch/arm64/configs/gki_defconfig').read_bytes())
           report = {'schema': 'pong-kernel-config-contract/1', 'required_y': required, 'not_applicable': not_applicable,
-                    'effective_fragment': str(target), 'requested_fragment_sha256': __import__('hashlib').sha256(requested).hexdigest(),
+                    'lto_mode': lto_mode, 'effective_fragment': str(target), 'requested_fragment_sha256': __import__('hashlib').sha256(requested).hexdigest(),
                     'unique_defconfig': unique_defconfig.name,
                     'cache_identity': 'The unique defconfig name is part of the marketplace action ccache key; affected-input changes cannot restore another key.'}
           pathlib.Path('collection/manifests/kernel-config-expectations.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
@@ -750,6 +754,14 @@ jobs:
         if: always()
         run: |
           if test -f "$RUNNER_TEMP/pong-http.pid"; then kill "$(cat "$RUNNER_TEMP/pong-http.pid")" 2>/dev/null || true; fi
+
+      - name: Preserve ccache even when a long build fails
+        if: ${{ always() && steps.marketplace_build.outcome == 'failure' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.ccache
+          # Same strict identity used by the pinned action; it restores only this fingerprint family.
+          key: ccache-pong_${{ needs.stack-governance.outputs.kernel_fingerprint }}_defconfig-${{ github.sha }}
 
       - name: Preserve first-build outputs and verify toolchain/config
         run: |

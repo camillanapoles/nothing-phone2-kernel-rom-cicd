@@ -110,7 +110,7 @@
     "on_reject_note": "build segue sem SUSFS (fallback declarado); ocultação cai para Zygisk Next"
    }
   ],
-  "lto": "thin",
+  "lto": "full",
   "jobs": "nproc",
   "reproducible": [
    "SOURCE_DATE_EPOCH fixo",
