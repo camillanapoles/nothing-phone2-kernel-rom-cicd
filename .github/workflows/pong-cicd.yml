@@ -1230,6 +1230,13 @@ jobs:
       automated_complete: ${{ steps.automated_report.outputs.complete }}
       manual_complete: ${{ steps.manual_report.outputs.complete }}
     steps:
+      - name: Clear evidence from previous staging runs
+        id: evidence_cleanup
+        run: |
+          set -Eeuo pipefail
+          rm -rf -- evidence
+          mkdir -p evidence
+
       - name: Download the exact candidate under test
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -1298,7 +1305,7 @@ jobs:
           def adb_base(*args, timeout=45):
               return run('adb', ['adb', '-s', serial, *args], log=f'adb-{next(adb_call_ids):04d}.log', timeout=timeout)
 
-          def root(command, log, timeout=45):
+          def adb_root(command, log, timeout=45):
               return run(log, ['adb', '-s', serial, 'shell', 'su', '-c', command], log=log, timeout=timeout)
 
           devices = run('adb_devices', ['adb', 'devices'])[1].decode('utf-8', 'replace')
@@ -1328,13 +1335,13 @@ jobs:
               if slot in ('_a', '_b'):
                   for base in ('/dev/block/by-name/', '/dev/block/bootdevice/by-name/'):
                       candidate = base + 'boot' + slot
-                      rc, target, _ = root(f'readlink -f {candidate}', 'boot_partition')
+                      rc, target, _ = adb_root(f'readlink -f {candidate}', 'boot_partition')
                       if rc == 0 and target.strip().startswith(b'/dev/'):
                           part = target.strip().decode()
                           break
               actual_boot = ''
               if part:
-                  rc, digest, _ = root(f'head -c {boot_size} {part} | sha256sum', 'active_boot_sha256', timeout=120)
+                  rc, digest, _ = adb_root(f'head -c {boot_size} {part} | sha256sum', 'active_boot_sha256', timeout=120)
                   actual_boot = digest.decode().split()[0] if digest.decode().split() else ''
               record('candidate_boot_active', 'PASS' if actual_boot == boot_sha else 'FAIL', f'expected={boot_sha} actual={actual_boot or "unavailable"}')
 
@@ -1355,54 +1362,54 @@ jobs:
               expected_cfg = hashlib.sha256((root / 'candidate/evox_pong_pack.config').read_bytes()).hexdigest()
               record('running_config_exact', 'PASS' if config_hash == expected_cfg else 'FAIL', f'expected={expected_cfg} actual={config_hash or err}')
 
-              rc, uid, _ = root('id -u', 'root_uid')
+              rc, uid, _ = adb_root('id -u', 'root_uid')
               record('root_uid', 'PASS' if rc == 0 and uid.strip() == b'0' else 'FAIL', uid.decode().strip())
               rc, enforce, _ = adb('shell', 'getenforce')
               record('selinux_enforcing', 'PASS' if enforce.strip() == b'Enforcing' else 'FAIL', enforce.decode().strip())
-              rc, ksu, _ = root('/data/adb/ksud --version', 'ksud_version')
+              rc, ksu, _ = adb_root('/data/adb/ksud --version', 'ksud_version')
               record('ksu_next_version', 'PASS' if rc == 0 and '3.4.2' in ksu.decode() else 'FAIL', ksu.decode().strip())
               rc, manager, _ = adb('shell', 'dumpsys', 'package', 'com.rifsxd.ksunext')
               (out / 'manager-package.txt').write_bytes(manager)
               record('ksu_manager', 'PASS' if rc == 0 and b'versionName=3.4.2' in manager else 'FAIL', 'com.rifsxd.ksunext versionName must be 3.4.2')
 
-              rc, version, _ = root('/data/adb/ksud susfs version', 'susfs_version')
+              rc, version, _ = adb_root('/data/adb/ksud susfs version', 'susfs_version')
               record('susfs_version', 'PASS' if rc == 0 and version.strip() == b'v2.3.0' else 'FAIL', version.decode().strip())
-              rc, variant, _ = root('/data/adb/ksud susfs variant', 'susfs_variant')
+              rc, variant, _ = adb_root('/data/adb/ksud susfs variant', 'susfs_variant')
               record('susfs_variant', 'PASS' if rc == 0 and variant.strip() == b'GKI' else 'FAIL', variant.decode().strip())
-              rc, features_b, _ = root('/data/adb/ksud susfs features', 'susfs_features')
+              rc, features_b, _ = adb_root('/data/adb/ksud susfs features', 'susfs_features')
               features = set(features_b.decode('utf-8', 'replace').split())
               required_features = {'SUSFS_LKM_MODULES', 'CONFIG_KSU_SUSFS_SUS_PATH', 'CONFIG_KSU_SUSFS_SUS_MOUNT', 'CONFIG_KSU_SUSFS_SUS_KSTAT', 'CONFIG_KSU_SUSFS_SPOOF_UNAME', 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS'}
               record('susfs_features', 'PASS' if rc == 0 and required_features <= features else 'FAIL', 'missing=' + ','.join(sorted(required_features - features)))
-              rc, _, _ = root('test -d /sys/module/susfs_guard_lkm', 'susfs_sysfs')
+              rc, _, _ = adb_root('test -d /sys/module/susfs_guard_lkm', 'susfs_sysfs')
               record('susfs_lkm_loaded', 'PASS' if rc == 0 else 'FAIL', '/sys/module/susfs_guard_lkm')
 
               collection_status = json.loads((root / 'collection/manifests/collection-status.json').read_text())
               r28_asset = next(a for a in collection_status['assets'] if a['id'] == 'susfs-userspace-r28')
               r28_expected = r28_asset['userspace_binary']['sha256']
               r28_path = '/data/adb/ksu/bin/ksu_susfs'
-              rc, r28_hash_b, _ = root(f'sha256sum {r28_path}', 'r28_binary_sha256')
+              rc, r28_hash_b, _ = adb_root(f'sha256sum {r28_path}', 'r28_binary_sha256')
               r28_fields = r28_hash_b.decode().split()
               r28_actual = r28_fields[0] if r28_fields else ''
-              rc, r28_version_b, _ = root(f'{r28_path} show version', 'r28_version')
+              rc, r28_version_b, _ = adb_root(f'{r28_path} show version', 'r28_version')
               r28_version = r28_version_b.decode().strip()
               record('susfs_r28_binary_exact', 'PASS' if r28_actual == r28_expected and r28_version == 'v2.3.0' else 'FAIL', f'expected_sha256={r28_expected} actual_sha256={r28_actual} version={r28_version}; online installer updates are not silently accepted')
 
-              rc, r28_variant_b, _ = root(f'{r28_path} show variant', 'r28_variant')
+              rc, r28_variant_b, _ = adb_root(f'{r28_path} show variant', 'r28_variant')
               r28_variant = r28_variant_b.decode().strip()
               record('susfs_r28_variant_abi', 'PASS' if rc == 0 and r28_variant == variant.decode().strip() == 'GKI' else 'FAIL', f'ksud={variant.decode().strip()} r28={r28_variant}; GKI describes ABI, not built-in versus LKM mode')
-              rc, r28_features_b, _ = root(f'{r28_path} show enabled_features', 'r28_enabled_features')
+              rc, r28_features_b, _ = adb_root(f'{r28_path} show enabled_features', 'r28_enabled_features')
               r28_features = set(r28_features_b.decode('utf-8', 'replace').split())
               r28_bridge = rc == 0 and 'SUSFS_LKM_MODULES' in r28_features and required_features <= r28_features
               record('susfs_r28_lkm_api_bridge', 'PASS' if r28_bridge else 'FAIL', 'missing=' + ','.join(sorted((required_features | {'SUSFS_LKM_MODULES'}) - r28_features)))
-              rc_disabled, _, _ = root('test ! -f /data/adb/modules/susfs4ksu/disable', 'r28_module_not_disabled')
-              rc_active, _, _ = root('test -f /data/adb/ksu/susfs4ksu/logs/susfs_active', 'r28_active_marker')
+              rc_disabled, _, _ = adb_root('test ! -f /data/adb/modules/susfs4ksu/disable', 'r28_module_not_disabled')
+              rc_active, _, _ = adb_root('test -f /data/adb/ksu/susfs4ksu/logs/susfs_active', 'r28_active_marker')
               record('susfs_r28_module_active', 'PASS' if rc_disabled == 0 and rc_active == 0 else 'FAIL', f'not_disabled_rc={rc_disabled} active_marker_rc={rc_active}')
 
               loader = '/data/adb/modules/susfs_lkm_loader/susfs_guard_lkm.ko'
-              rc, loader_b, _ = root(f'sha256sum {loader}', 'loader_sha256')
+              rc, loader_b, _ = adb_root(f'sha256sum {loader}', 'loader_sha256')
               loader_actual = loader_b.decode().split()[0] if loader_b.decode().split() else ''
               loader_expected = hashlib.sha256((root / 'candidate/standalone/android13-5.10_susfs_guard_lkm.ko').read_bytes()).hexdigest()
-              rc_script, _, _ = root('test -x /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh', 'loader_script')
+              rc_script, _, _ = adb_root('test -x /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh', 'loader_script')
               record('susfs_loader_exact', 'PASS' if loader_actual == loader_expected and rc_script == 0 else 'FAIL', f'expected={loader_expected} actual={loader_actual} pre_module_script_rc={rc_script}')
 
               rc, uptime_b, _ = adb('shell', 'cat', '/proc/uptime')
@@ -1411,7 +1418,7 @@ jobs:
               except Exception:
                   uptime = 0.0
               record('uptime_10_minutes', 'PASS' if uptime >= 600 else 'FAIL', f'uptime_seconds={uptime}')
-              rc, dmesg, _ = root('dmesg', 'dmesg', timeout=60)
+              rc, dmesg, _ = adb_root('dmesg', 'dmesg', timeout=60)
               (out / 'dmesg.txt').write_bytes(dmesg)
               panic = re.search(rb'Kernel panic|Unable to handle kernel|Internal error: Oops', dmesg, re.I)
               record('no_kernel_panic', 'PASS' if rc == 0 and not panic else 'FAIL', panic.group().decode() if panic else 'no panic signature found')
@@ -1419,7 +1426,7 @@ jobs:
               pushed = run('push_selftest', ['adb', '-s', serial, 'push', 'candidate/tests/pong-kernel-selftest', '/data/local/tmp/pong-kernel-selftest'], log='push-selftest.log')
               if pushed[0] == 0:
                   adb('shell', 'chmod', '0755', '/data/local/tmp/pong-kernel-selftest')
-                  rc, selftest, _ = root('/data/local/tmp/pong-kernel-selftest', 'kernel-selftest', timeout=90)
+                  rc, selftest, _ = adb_root('/data/local/tmp/pong-kernel-selftest', 'kernel-selftest', timeout=90)
                   record('namespace_ipc_bpf_syscalls', 'PASS' if rc == 0 and b'PASS pong kernel namespace/IPC/BPF self-test' in selftest else 'FAIL', selftest.decode('utf-8', 'replace').strip())
                   adb('shell', 'rm', '-f', '/data/local/tmp/pong-kernel-selftest')
               else:
@@ -1528,7 +1535,8 @@ jobs:
           PY
 
       - name: Upload automated and validated manual evidence
-        if: always()
+        # Never republish stale files when cleanup itself failed on a persistent runner.
+        if: ${{ always() && steps.evidence_cleanup.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pong-device-evidence
@@ -1688,7 +1696,8 @@ jobs:
           gh attestation verify --repo "$GITHUB_REPOSITORY" candidate/SOURCE.tar.gz
           TAG="pong-11.11-rc${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          cat > candidate/RC-NOTES.md <<EOF
+          mkdir -p release
+          cat > release/RC-NOTES.md <<EOF
           # Pong Evolution X 11.11 — draft release candidate
 
           - KernelSU-Next: **v3.4.2 embedded**.
@@ -1699,8 +1708,21 @@ jobs:
           - Deployment mode: **release-only; no CI flash and no production deployment**.
           - Long-term 72-hour soak and production Slot A/B promotion are not claimed by this RC.
 
-          This is a DRAFT candidate, not a stable release. Verify \`SHA256SUMS\` and attestation before any manual staging operation.
+          This is a DRAFT candidate, not a stable release. Verify the release-level \`SHA256SUMS\`, extract \`Pong-EvoX-KSU-Next-RC-files.tar.gz\` into an empty directory, and run \`sha256sum -c SHA256SUMS\` there before any manual staging operation. The archive preserves \`standalone/\`, \`tests/\`, and all other candidate paths.
           EOF
+
+      - name: Package and verify a path-preserving release archive
+        run: |
+          set -Eeuo pipefail
+          ARCHIVE=Pong-EvoX-KSU-Next-RC-files.tar.gz
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf - -C candidate . | gzip -n -9 > "release/$ARCHIVE"
+          (cd release && sha256sum "$ARCHIVE" RC-NOTES.md > SHA256SUMS && sha256sum -c SHA256SUMS)
+          rm -rf -- work/release-verify
+          mkdir -p work/release-verify
+          tar -xzf "release/$ARCHIVE" -C work/release-verify
+          (cd work/release-verify && sha256sum -c SHA256SUMS)
+          diff -qr candidate work/release-verify
 
       - name: Enforce GitHub release asset limits before drafting
         run: |
@@ -1710,7 +1732,7 @@ jobs:
 
           # Each release asset must be strictly below 2 GiB; a release has at most 1000 assets.
           limit = 2 * 1024**3
-          files = sorted(path for path in Path('candidate').rglob('*') if path.is_file())
+          files = sorted(path for path in Path('release').rglob('*') if path.is_file())
           oversized = [(path.as_posix(), path.stat().st_size) for path in files if path.stat().st_size >= limit]
           assert len(files) <= 1000, f'Too many release assets: {len(files)}'
           assert not oversized, f'Assets must use verified external storage instead of GitHub Releases: {oversized}'
@@ -1725,13 +1747,12 @@ jobs:
           tag_name: ${{ steps.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: Pong 11.11 RC ${{ github.run_number }} — staging verified
-          body_path: candidate/RC-NOTES.md
+          body_path: release/RC-NOTES.md
           draft: true
           prerelease: true
           fail_on_unmatched_files: true
           files: |
-            candidate/*
-            candidate/**/*
+            release/*
 
   mandate:
     name: mandate · release-only fail-closed result
