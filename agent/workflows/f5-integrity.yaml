@@ -1,0 +1,130 @@
+# F5 — integridade. O ponto onde é mais fácil mentir: BASIC/DEVICE são estados, não opiniões.
+name: "F5 · Integridade (PIFork + TEESimulator + keybox)"
+description: "Um engine por função, keybox revogada = PENDENTE, vbmeta por último. STRONG é opcional e frágil."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F5
+  owner: integrity-analyst
+  deterministic_gate:
+    kind: device
+    command: "bash scripts/rollout_gate.sh F5"
+    expect: "exit 0; checker com BASIC verde e DEVICE verde ou PENDENTE explícito"
+  source_of_truth: [INSTALL-SEQUENCE.md, objects/install-stack.json]
+  failure_policy: stop-on-fail
+  safety:
+    slot: a
+    one_engine_per_function: true
+    manual_execution_only: true
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: One/Workspace autenticando com DEVICE verde)"
+    required: true
+  - name: target_apps
+    description: "apps de One/Workspace que precisam autenticar"
+    default: "com.android.vending, apps de One/Workspace da pessoa"
+
+steps:
+  - id: pifork_basic
+    role: integrity-analyst
+    skill: [falsifiable-evidence]
+    task: |
+      Objetivo: {{goal}}
+
+      F5.1 — PlayIntegrityFork (props/fingerprint). Instalar, reboot, provar BASIC verde com o
+      checker escolhido, citando a saída literal. Sem checker, o item é PENDENTE.
+    output: basic_ledger
+    artifacts: [agent/artifacts/f5/basic.md]
+    pass_criteria:
+      - "BASIC verde com saída do checker + timestamp"
+      - "fingerprint usado registrado (não 'o padrão')"
+
+  - id: attestation_engine
+    role: integrity-analyst
+    skill: [falsifiable-evidence]
+    depends_on: [pifork_basic]
+    task: |
+      F5.2/F5.3 — TEESimulator-RS Enhanced v6.0.1-360-enhanced como engine de atestação.
+      Provar: engine carregada, `keystore2` interceptado, keybox NÃO revogada (ou PENDENTE exit 3).
+
+      BASIC: {{basic_ledger}}
+    output: engine_ledger
+    pass_criteria:
+      - "engine carregada com evidência de log/dumpsys"
+      - "status da keybox com data e hora da verificação"
+      - "keybox revogada = PENDENTE, nunca 'verde com ressalva'"
+      - "dois engines de atestação no mesmo boot = FAIL imediato"
+
+  - id: target_and_patch
+    role: integrity-analyst
+    skill: [pin-discipline, falsifiable-evidence]
+    depends_on: [attestation_engine]
+    task: |
+      F5.4/F5.5 — `target.txt` com `com.android.vending` + apps alvo ({{target_apps}});
+      `security_patch` dentro de 12 meses. Cite o arquivo e o valor lido.
+
+      Engine: {{engine_ledger}}
+    output: target_ledger
+    pass_criteria:
+      - "target.txt conferido linha a linha contra a lista de apps"
+      - "security_patch com data legível e dentro de 12 meses"
+
+  - id: vbmeta_last
+    role: device-qa
+    skill: [artifact-integrity]
+    depends_on: [target_and_patch]
+    task: |
+      F5.6 — VBMeta Fixer por ÚLTIMO (depois de PIFork e do engine). Confirmar boot sem erro de
+      vbmeta e registrar o hash do que foi instalado.
+    output: vbmeta_ledger
+    pass_criteria:
+      - "ordem comprovada: PIFork → engine → vbmeta fixer"
+      - "hash do módulo instalado registrado"
+
+  - id: integrity_verdict
+    role: evidence-auditor
+    skill: [falsifiable-evidence]
+    depends_on: [vbmeta_last]
+    task: |
+      F5.7/F5.8 — checker de integridade e um app real de One/Workspace abrindo e autenticando.
+      Monte a matriz final: BASIC, DEVICE, STRONG (se houver), app real.
+
+      Ledgers: {{basic_ledger}} / {{engine_ledger}} / {{target_ledger}} / {{vbmeta_ledger}}
+    output: integrity_matrix
+    artifacts: [agent/artifacts/f5/matrix.md]
+    pass_criteria:
+      - "DEVICE verde OU PENDENTE com motivo; nunca 'quase'"
+      - "STRONG classificado como opcional e frágil"
+      - "app real autenticou, com timestamp"
+
+  - id: integrity_boundary
+    role: security-reviewer
+    skill: [artifact-integrity]
+    depends_on: [integrity_verdict]
+    task: |
+      Feche a fronteira de F5: um dono por função (PIFork, TEESimulator, keybox, vbmeta — nesta
+      ordem), nenhum módulo vetado instalado, nenhuma keybox em log/artefato publicável.
+
+      Matriz: {{integrity_matrix}}
+    output: f5_boundary
+    pass_criteria:
+      - "ordem PIFork → engine → vbmeta comprovada"
+      - "nenhum engine concorrente (TrickyStore e afins ausentes)"
+      - "keybox não aparece em log, artefato ou repositório"
+    veto:
+      on: "dois engines de atestação ou keybox exposta em artefato"
+      escalate_on: "keybox revogada e a pessoa pede release mesmo assim"
+    handoff:
+      declares:
+        BASIC: "green|red|pending"
+        DEVICE: "green|red|pending"
+        STRONG: "green|red|not-attempted"
+        keybox_status: "valid|revoked|expired|unknown"
+        real_app_login: "pass|fail|pending"
+      evidence:
+        - "checker de integridade (saída literal)"
+        - "adb shell dumpsys package com.android.vending | grep versionName"

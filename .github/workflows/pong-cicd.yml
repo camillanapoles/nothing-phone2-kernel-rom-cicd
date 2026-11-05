@@ -102,6 +102,14 @@ jobs:
           mkdir -p logs/governance collection/manifests
           python3 scripts/stack_gate.py --config objects/install-stack.json 2>&1 | tee logs/governance/stack-gate.log
           python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json 2>&1 | tee logs/governance/kernel-build-gate.log
+          # Gate do PROCESSO do agente: papéis, skills, workflows, prompts. Não toca no modelo —
+          # é justamente isso que ele prova (nenhum provider/model/base_url pinado em agent/**).
+          python3 scripts/ao_gate.py 2>&1 | tee logs/governance/agent-gate.log
+          python3 scripts/workflow_audit.py 2>&1 | tee logs/governance/workflow-boundary-audit.log
+          # Proveniência do processo: o que rodou é este conjunto de arquivos, não "um modelo".
+          python3 scripts/ao_gate.py --json | python3 -c "import json,sys; print('agent-process-fingerprint:', json.load(sys.stdin)['process_fingerprint'])" | tee logs/governance/agent-process-fingerprint.txt
+          # O gate tem de REPROVAR: um gate que só passa não prova nada.
+          python3 scripts/test_agent_contract.py 2>&1 | tee logs/governance/agent-gate-mutation.log
           (cd kernel/patches && sha256sum -c SHA256SUMS) 2>&1 | tee logs/governance/patch-hashes.log
 
       - name: Audit the single workflow and action pins

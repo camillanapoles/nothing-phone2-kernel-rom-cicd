@@ -1,0 +1,26 @@
+# Índice de composição do prompt do agente.
+#
+# Nada aqui é um prompt de modelo pronto — é a montagem determinística do "quem sou eu, o que posso,
+# como provo". A ordem importa: identidade, fronteira, método. `scripts/ao_gate.py` prova que cada
+# parte existe e que a concatenação cobre as seções obrigatórias.
+schema: pong-agent-prompt/1
+parts:
+  - id: identity
+    file: identity.md
+    required_sections: ["Identidade", "O que o modelo não é"]
+  - id: authority
+    file: authority.md
+    required_sections: ["Fronteira", "Veto", "Escalonamento"]
+  - id: method
+    file: method.md
+    required_sections: ["Evidência", "Fases", "Handoff"]
+compose:
+  order: [identity, authority, method]
+  separator: "\n\n---\n\n"
+  # Proibido no prompt montado: qualquer coisa que fixe um modelo específico.
+  forbidden_patterns:
+    - "(?i)\\b(claude|gpt|gemini|deepseek|qwen|llama|grok)\\s*(model|v?\\d)"
+    - "(?i)provider:\\s*(?!host-agent)"
+    - "(?i)base_url|api_key"
+  target:
+    claude_agents_file: .claude/agents/pong-orchestrator.md

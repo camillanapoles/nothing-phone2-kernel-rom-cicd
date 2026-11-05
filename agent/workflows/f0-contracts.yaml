@@ -1,0 +1,111 @@
+# F0 — contratos, pins e identidade de run.
+# Nenhum nó aqui toca o aparelho: a fase inteira é prova documental e determinística.
+name: "F0 · Contratos e cesta"
+description: "Fecha os contratos (objetos, gates, pins, workflow) antes de qualquer download ou build. Falha = nada começa."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F0
+  owner: release-orchestrator
+  deterministic_gate:
+    kind: command
+    command: "make -s stack && make -s kernel-build && make -s agent && make -s workflow-audit"
+    expect: "exit 0"
+  source_of_truth: [objects/install-stack.json, objects/kernel-build-plan.json, objects/rom-artifacts.json]
+  failure_policy: block-all
+
+# O host é o runtime. Modelo vazio de propósito: trocar de modelo não muda o contrato.
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: fechar F0 no commit atual)"
+    required: true
+
+steps:
+  - id: contract_audit
+    role: product-steward
+    skill: [pin-discipline]
+    task: |
+      Objetivo da rodada: {{goal}}
+
+      Audite os contratos antes de qualquer trabalho:
+      1. `objects/install-stack.json` — 16 invariantes declaradas, camadas `required` presentes.
+      2. `objects/kernel-build-plan.json` — pin de fonte `4ec5491f6b5f…` (LineageOS sm8475,
+         lineage-23.2), sha256 dos patches 001/002, clang-r530567 e KMI android13-5.10.
+      3. `objects/rom-artifacts.json` — sha256 das variantes, URL canônica.
+      4. `agent/**` — papéis, skills, workflows e prompts coerentes entre si.
+
+      Para cada item: PASSA ou PENDENTE, com o motivo. Não proponha mudança de escopo sem citar a
+      fase F0–F8 afetada.
+    output: contract_findings
+    artifacts: [agent/artifacts/f0/contract-audit.md]
+    pass_criteria:
+      - "todos os 4 objetos citados existem e foram lidos"
+      - "cada invariante INV-01..INV-16 aparece com veredito explícito"
+      - "nenhum pin inventado: valor ausente vira PENDENTE com motivo"
+    handoff:
+      declares:
+        contracts_closed: "true|false"
+        pending: "lista"
+      evidence:
+        - "python3 scripts/stack_gate.py --config objects/install-stack.json"
+        - "python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json"
+
+  - id: gate_evidence
+    role: evidence-auditor
+    skill: [falsifiable-evidence]
+    depends_on: [contract_audit]
+    task: |
+      Rode os gates e registre a saída literal de cada um (exit code + última linha do resumo).
+      Achados de contrato: {{contract_findings}}
+
+      Se algum gate sair diferente de 0, o item é FAIL (1) ou PENDENTE (3) — nunca PASS.
+    output: gate_ledger
+    artifacts: [agent/artifacts/f0/gates.log]
+    pass_criteria:
+      - "cada gate tem comando, exit code e uma linha de saída colada"
+      - "exit 3 aparece como PENDENTE, não como PASS"
+    deterministic_gate:
+      kind: command
+      command: "make -s stack && make -s kernel-build"
+      expect: "exit 0"
+
+  - id: pin_sync
+    role: kernel-architect
+    skill: [pin-discipline]
+    depends_on: [gate_evidence]
+    task: |
+      Confira que o pin do kernel, o sha256 dos patches e a versão de toolchain aparecem IGUAIS em:
+      `objects/kernel-build-plan.json`, `.github/workflows/pong-cicd.yml` (env), `README.md` e
+      `INSTALL-SEQUENCE.md`. Divergência é FAIL, mesmo que o build funcione.
+    output: pin_sync_report
+    pass_criteria:
+      - "cada pin aparece com o valor literal nos 4 lugares"
+      - "divergência listada com arquivo:linha"
+
+  - id: workflow_boundary
+    role: security-reviewer
+    skill: [release-only, pipeline-fail-closed]
+    depends_on: [pin_sync]
+    task: |
+      Prove a fronteira de autoridade do pipeline:
+      1. Nenhum `fastboot flash`, `adb sideload`, `set_active` no texto executável do workflow.
+      2. Toda ação de terceiro em sha40.
+      3. `production_authorized` e `production_deployed` são `false` no código do `mandate`.
+      4. Nenhum segredo obrigatório fora do runner.
+    output: boundary_verdict
+    artifacts: [agent/artifacts/f0/boundary.md]
+    pass_criteria:
+      - "os 4 pontos têm saída de comando, não afirmação"
+      - "qualquer operação de deploy encontrada = veto, fase bloqueada"
+    veto:
+      on: "operação de deploy no texto executável"
+      escalate_on: "a pessoa afirma que já gravou slot B e pede para continuar"
+    handoff:
+      declares:
+        boundary_clean: "true|false"
+        open_vetoes: "lista"
+      evidence:
+        - "python3 - <<'PY' ... auditor de pins e deploy ... PY"

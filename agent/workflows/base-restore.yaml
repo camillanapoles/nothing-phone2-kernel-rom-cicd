@@ -1,0 +1,147 @@
+# F1–F3 — base, saneamento e root. Fase física: o agente planeja e audita, o host grava.
+# Regra dura: um módulo por reboot, Slot A, PASS antes do próximo.
+name: "F1–F3 · Base, saneamento e root (Slot A)"
+description: "Plano executável e auditoria do aparelho: firmware, ROM vanilla, NikGapps Core, saneamento do primeiro boot e root via kernel."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F1
+  phases: [F1, F2, F3]
+  owner: release-orchestrator
+  deterministic_gate:
+    kind: device
+    command: "bash scripts/rollout_gate.sh F1 && bash scripts/rollout_gate.sh F2 && bash scripts/rollout_gate.sh F3"
+    expect: "exit 0 em cada fase; cada item com PASS literal"
+  source_of_truth: [INSTALL-SEQUENCE.md, objects/install-stack.json, objects/rom-artifacts.json]
+  failure_policy: stop-on-fail
+  safety:
+    slot: a
+    one_module_per_reboot: true
+    manual_execution_only: true
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: F3 com su uid=0 em Slot A)"
+    required: true
+  - name: device_state
+    description: "slot atual, build atual, o que já está gravado"
+    default: "slot A, stock, sem root"
+  - name: artifacts_dir
+    description: "diretório local com boot.img, dtbo.img e SHA256SUMS verificados"
+    default: "."
+
+steps:
+  - id: preflight
+    role: evidence-auditor
+    skill: [falsifiable-evidence, artifact-integrity]
+    task: |
+      Objetivo: {{goal}}
+      Estado do aparelho: {{device_state}}
+      Artefatos em: {{artifacts_dir}}
+
+      Feche F0 antes de qualquer gravação:
+      1. `sha256sum -c SHA256SUMS` nos artefatos.
+      2. `fastboot devices` responde com o serial esperado.
+      3. Backup do `boot.img` stock com hash.
+      Cada item: comando, saída literal, timestamp. Faltando um → PENDENTE (exit 3) e a fase não abre.
+    output: preflight_ledger
+    artifacts: [agent/artifacts/f1/preflight.md]
+    pass_criteria:
+      - "sha256sum -c exit 0 com a saída colada"
+      - "serial do aparelho confere com o declarado"
+      - "backup do boot stock existe com hash registrado"
+
+  - id: base_flash_plan
+    role: release-orchestrator
+    skill: [phase-gate, release-only]
+    depends_on: [preflight]
+    task: |
+      Produza o plano de F1 (Slot A) como texto para execução humana, um comando por linha, com o
+      PASS esperado na linha seguinte:
+
+      legacy: firmware → format data → boot + sideload vanilla → NikGapps Core (sem reboot no meio) → reboot
+
+      Sempre `--slot=a`. Nunca slot B, nunca `set_active`, nunca dois módulos no mesmo boot.
+      Pré-condição: {{preflight_ledger}}
+    output: f1_plan
+    artifacts: [.install-plan.md]
+    pass_criteria:
+      - "todo comando tem --slot=a explícito"
+      - "cada comando tem critério PASS e ação no FAIL"
+      - "nenhum comando é executado por este passo (plano, não execução)"
+
+  - id: first_boot_sanitation
+    role: device-qa
+    skill: [falsifiable-evidence]
+    depends_on: [base_flash_plan]
+    task: |
+      F2 — saneamento do primeiro boot, com PASS por item:
+      setup sem restaurar backup · auto-update do Play off · auto-sync e Play Protect scan off ·
+      WebView AOSP válido (`dumpsys webviewupdate`) · OTA congelado.
+
+      Plano: {{f1_plan}}
+    output: f2_ledger
+    artifacts: [agent/artifacts/f2/sanitation.md]
+    pass_criteria:
+      - "cada toggle tem comando de leitura comprovando o estado"
+      - "WebView AOSP comprovado por dumpsys, não por suposição"
+      - "item sem leitura possível = PENDENTE"
+
+  - id: root_verification
+    role: device-qa
+    skill: [falsifiable-evidence]
+    depends_on: [first_boot_sanitation]
+    task: |
+      F3 — root em kernel, Slot A:
+      `fastboot flash boot_a boot-ksu.img` (humano executa) → manager KSU-Next → `su -c id` = uid=0.
+      Backup do boot com root, com hash.
+
+      Estado: {{f2_ledger}}
+    output: f3_ledger
+    artifacts: [agent/artifacts/f3/root.md]
+    pass_criteria:
+      - "su -c id devolve uid=0(root) com a saída literal"
+      - "boot com root tem backup e sha256 registrados"
+      - "nenhuma outra alteração no mesmo boot"
+
+  - id: boundary_check
+    role: security-reviewer
+    skill: [release-only, falsifiable-evidence]
+    depends_on: [root_verification]
+    task: |
+      Confira as fronteiras depois de F3: nada em slot B, nenhum módulo extra instalado "de passagem",
+      nenhum segredo em log desta fase.
+
+      Ledgers: {{f1_plan}} / {{f2_ledger}} / {{f3_ledger}}
+    output: boundary_check
+    pass_criteria:
+      - "slot continua A (leitura de getprop/fastboot getvar)"
+      - "lista de módulos instalados == lista do stack"
+    veto:
+      on: "slot B ativo ou módulo fora do stack"
+      escalate_on: "a pessoa pede para seguir mesmo com slot alterado"
+  - id: phase_verdict
+    role: release-orchestrator
+    skill: [phase-gate]
+    depends_on: [boundary_check]
+    task: |
+      Feche F1–F3: cada item `required` em PASS, `optional` declarado, e o próximo passo (F4) liberado.
+      Fronteira: {{boundary_check}}
+    output: f123_verdict
+    pass_criteria:
+      - "todo item required de F1, F2 e F3 tem PASS com saída literal"
+      - "slot continua A"
+      - "o próximo reboot é F4.1 (SUSFS R28), e só ele"
+    handoff:
+      declares:
+        slot: "a"
+        root: "pass|fail|pending"
+        rom_version: "string"
+        pending: "lista"
+      evidence:
+        - "adb shell getprop ro.build.fingerprint"
+        - "adb shell su -c id"
+        - "fastboot getvar current-slot"
