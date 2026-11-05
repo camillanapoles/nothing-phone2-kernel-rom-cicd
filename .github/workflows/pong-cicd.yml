@@ -659,11 +659,15 @@ jobs:
           git -C kernel-source/KernelSU-Next checkout --detach "$KSU_COMMIT"
           test "$(git -C kernel-source/KernelSU-Next rev-parse HEAD)" = "$KSU_COMMIT"
           test "$(git -C kernel-source/KernelSU-Next describe --tags --abbrev=0)" = "$KSU_VERSION"
+          KSU_GIT_COUNT="$(git -C kernel-source/KernelSU-Next rev-list --count HEAD)"
+          case "$KSU_GIT_COUNT" in ''|*[!0-9]*) echo '::error::Invalid KernelSU-Next revision count'; exit 1 ;; esac
+          export KSU_GIT_COUNT
           grep -q '#define SUSFS_LKM_VERSION "2.3.0-gki"' kernel-source/KernelSU-Next/kernel/susfs/susfs.h
           ln -s ../KernelSU-Next/kernel kernel-source/drivers/kernelsu
           printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel-source/drivers/Makefile
           python3 - <<'PY'
           from pathlib import Path
+          import os
           p = Path('kernel-source/drivers/Kconfig')
           text = p.read_text()
           needle = 'source "drivers/kernelsu/Kconfig"'
@@ -671,12 +675,31 @@ jobs:
           pos = text.rfind('endmenu')
           assert pos >= 0
           p.write_text(text[:pos] + needle + '\n' + text[pos:])
+
+          kbuild = Path('kernel-source/KernelSU-Next/kernel/Kbuild')
+          text = kbuild.read_text()
+          marker = '# Calculate version if git version is available'
+          assert text.count(marker) == 1
+          count = os.environ['KSU_GIT_COUNT']
+          assert count.isdecimal() and int(count) > 0
+          tag = os.environ['KSU_VERSION']
+          pinned = (
+              '# Preserve exact pinned version metadata in SOURCE.tar.gz without .git.\n'
+              'KSU_GIT_VERSION_VALID := 1\n'
+              f'KSU_GIT_VERSION := {count}\n'
+              f'KSU_GIT_TAG := {tag}\n\n'
+          )
+          kbuild.write_text(text.replace(marker, pinned + marker, 1))
+          print(f'Pinned KernelSU-Next metadata: version={30000 + int(count)} tag={tag}')
           PY
           {
             git -C kernel-source diff --check
+            git -C kernel-source/KernelSU-Next diff --check
             git -C kernel-source diff --stat
             git -C kernel-source diff > logs/kernel/tracked-source-changes.patch
+            git -C kernel-source/KernelSU-Next diff -- kernel/Kbuild > logs/kernel/ksu-version-metadata.patch
             git -C kernel-source status --short
+            git -C kernel-source/KernelSU-Next status --short
           } 2>&1 | tee logs/kernel/integration.log
 
       - name: Generate the effective config from the JSON contract
@@ -926,9 +949,14 @@ jobs:
           mkdir -p /data/adb/post-fs-data.d
           cat > /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh <<'LOADER'
           #!/system/bin/sh
-          MODULE_DIR=/data/adb/modules/susfs_lkm_loader
-          [ ! -f "$MODULE_DIR/disable" ] || exit 0
-          [ ! -f "$MODULE_DIR/remove" ] || exit 0
+          INSTALLED_DIR=/data/adb/modules/susfs_lkm_loader
+          PENDING_DIR=/data/adb/modules_update/susfs_lkm_loader
+          MODULE_DIR="$INSTALLED_DIR"
+          [ ! -d "$PENDING_DIR" ] || MODULE_DIR="$PENDING_DIR"
+          for directory in "$INSTALLED_DIR" "$PENDING_DIR"; do
+            [ ! -f "$directory/disable" ] || exit 0
+            [ ! -f "$directory/remove" ] || exit 0
+          done
           [ -f "$MODULE_DIR/susfs_guard_lkm.ko" ] || exit 1
           if ! /data/adb/ksud susfs version >/dev/null 2>&1; then
             if /data/adb/ksud insmod "$MODULE_DIR/susfs_guard_lkm.ko" >/dev/null 2>&1; then
@@ -981,9 +1009,11 @@ jobs:
           #define IPC_PRIVATE 0
           #define IPC_CREAT 01000
           #define IPC_RMID 0
+          #define O_WRONLY 01
           #define O_CREAT 0100
           #define O_EXCL 0200
           #define O_RDWR 02
+          #define AT_FDCWD -100
           #define SIGCHLD 17
 
           static long syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
@@ -1007,6 +1037,45 @@ jobs:
           #define SAY(s) say(s, sizeof(s) - 1)
           static int fail(const char *s, unsigned long n, int code) { say(s, n); return code; }
           #define FAIL(s, code) fail(s, sizeof(s) - 1, code)
+
+          static unsigned long append_decimal(char *output, unsigned long value) {
+              char reversed[24];
+              unsigned long digits = 0, length = 0;
+              do {
+                  reversed[digits++] = (char)('0' + value % 10);
+                  value /= 10;
+              } while (value);
+              while (digits) output[length++] = reversed[--digits];
+              return length;
+          }
+
+          static int write_text_file(const char *path, const char *text, unsigned long length) {
+              long fd = call4(__NR_openat, AT_FDCWD, (long)path, O_WRONLY, 0);
+              if (fd < 0) return -1;
+              long written = call3(__NR_write, fd, (long)text, length);
+              (void)call1(__NR_close, fd);
+              return written == (long)length ? 0 : -1;
+          }
+
+          static int write_id_map(const char *path, unsigned long parent_id) {
+              char mapping[64];
+              unsigned long length = 0;
+              mapping[length++] = '0';
+              mapping[length++] = ' ';
+              length += append_decimal(mapping + length, parent_id);
+              mapping[length++] = ' ';
+              mapping[length++] = '1';
+              mapping[length++] = '\n';
+              return write_text_file(path, mapping, length);
+          }
+
+          static int map_user_namespace(unsigned long parent_uid, unsigned long parent_gid) {
+              static const char deny[] = "deny\n";
+              if (write_text_file("/proc/self/setgroups", deny, sizeof(deny) - 1) < 0) return -1;
+              if (write_id_map("/proc/self/uid_map", parent_uid) < 0) return -1;
+              if (write_id_map("/proc/self/gid_map", parent_gid) < 0) return -1;
+              return 0;
+          }
 
           static int ipc_tests(void) {
               long shm = call3(__NR_shmget, IPC_PRIVATE, 4096, IPC_CREAT | 0600);
@@ -1051,11 +1120,20 @@ jobs:
           void _start(void) {
               int rc = bpf_test();
               if (rc) call1(__NR_exit, rc);
+              long parent_uid = call0(__NR_geteuid);
+              long parent_gid = call0(__NR_getegid);
+              if (parent_uid < 0 || parent_gid < 0) { SAY("FAIL read parent uid/gid\n"); call1(__NR_exit, 50); }
               long flags[] = { CLONE_NEWUSER, CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID };
               const char *names[] = { "user", "ipc", "uts", "net", "mount", "pid" };
               for (long i = 0; i < 6; i++) {
                   if (call1(__NR_unshare, flags[i]) < 0) {
                       SAY("FAIL unshare namespace: "); sayz(names[i]); SAY("\n"); call1(__NR_exit, 30 + i);
+                  }
+                  if (flags[i] == CLONE_NEWUSER) {
+                      if (map_user_namespace((unsigned long)parent_uid, (unsigned long)parent_gid) < 0) {
+                          SAY("FAIL map user namespace uid/gid\n"); call1(__NR_exit, 51);
+                      }
+                      SAY("PASS user uid/gid maps\n");
                   }
               }
               SAY("PASS unshare user ipc uts net mount pid\n");

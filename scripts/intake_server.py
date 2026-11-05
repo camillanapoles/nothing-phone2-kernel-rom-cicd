@@ -18,8 +18,9 @@ import secrets
 import shutil
 import tempfile
 import textwrap
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 SCHEMA = "pong-intake-candidate/1"
@@ -216,7 +217,8 @@ def store_candidate(
         destination = root / stored_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
-            if not destination.is_file() or destination.stat().st_size != length:
+            if (not destination.is_file() or destination.stat().st_size != length
+                    or not hmac.compare_digest(file_sha256(destination), actual)):
                 raise UploadError(409, "content-addressed destination collision")
             part_path.unlink(missing_ok=True)
         else:
@@ -237,7 +239,8 @@ def store_candidate(
     destination = destination_dir / filename
     duplicate = destination.exists()
     if duplicate:
-        if not destination.is_file() or destination.stat().st_size != length:
+        if (not destination.is_file() or destination.stat().st_size != length
+                or not hmac.compare_digest(file_sha256(destination), actual)):
             raise UploadError(409, "content-addressed destination collision")
         part_path.unlink(missing_ok=True)
     else:
@@ -321,6 +324,16 @@ $('asset').addEventListener('change',details);$('file').addEventListener('change
 $('upload').addEventListener('click',async()=>{const file=$('file').files[0];if(!file||busy)return;if(!crypto.subtle){show('Este navegador não oferece WebCrypto SHA256 em contexto seguro.');return}busy=true;validate();$('progress').hidden=false;$('progress').value=0;try{show('Inicializando upload em partes…');const init=await api('/api/upload/init',{method:'POST',headers:{'X-Intake-Token':$('token').value,'Content-Type':'application/json'},body:JSON.stringify({asset:$('asset').value,filename:file.name,size:file.size,source_url:$('source').value,note:$('note').value})});const total=Math.ceil(file.size/init.chunk_size);for(let index=0;index<total;index++){const offset=index*init.chunk_size;const blob=file.slice(offset,Math.min(offset+init.chunk_size,file.size));const buffer=await blob.arrayBuffer();const digest=await crypto.subtle.digest('SHA-256',buffer);const hash=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');await retry(()=>chunkRequest(init.upload_id,index,blob,hash,offset,file.size))}show('Partes recebidas. Verificando o SHA256 completo…');const data=await retry(()=>api(`/api/upload/complete?id=${init.upload_id}`,{method:'POST',headers:{'X-Intake-Token':$('token').value}}));$('progress').value=100;success(data)}catch(e){show(`Envio rejeitado: ${e.message}\nNenhum objeto canônico foi alterado.`)}finally{busy=false;$('progress').hidden=true;validate()}});
 load().catch(e=>show(e.message));
 </script></body></html>"""
+
+
+class IntakeServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address, handler_class):
+        super().__init__(server_address, handler_class)
+        # Serialize upload/session/disk-reservation changes. Mirror streams and
+        # health/catalog reads do not need this lock and can proceed concurrently.
+        self.state_lock = threading.RLock()
 
 
 class IntakeHandler(BaseHTTPRequestHandler):
@@ -449,12 +462,13 @@ class IntakeHandler(BaseHTTPRequestHandler):
             elif path == "/health":
                 self.send_json(200, {"status": "ok", "chunked_upload": True, "canonical_objects_modified": False})
             elif path == "/api/upload/status":
-                self.authenticate()
-                upload_id = parse_qs(split.query).get("id", [""])[-1]
-                _, session = self.load_session(upload_id)
-                directory = self.session_dir(upload_id)
-                received = sorted(int(p.stem) for p in (directory / "chunks").glob("*.json")) if (directory / "chunks").exists() else []
-                self.send_json(200, {"upload_id": upload_id, "status": session["status"], "bytes": session["bytes"], "chunk_size": session["chunk_size"], "received": received})
+                with self.server.state_lock:  # type: ignore[attr-defined]
+                    self.authenticate()
+                    upload_id = parse_qs(split.query).get("id", [""])[-1]
+                    _, session = self.load_session(upload_id)
+                    directory = self.session_dir(upload_id)
+                    received = sorted(int(p.stem) for p in (directory / "chunks").glob("*.json")) if (directory / "chunks").exists() else []
+                    self.send_json(200, {"upload_id": upload_id, "status": session["status"], "bytes": session["bytes"], "chunk_size": session["chunk_size"], "received": received})
             elif re.fullmatch(r"/mirror/[0-9a-f]{32}", path):
                 self.serve_mirror(split)
             else:
@@ -497,6 +511,10 @@ class IntakeHandler(BaseHTTPRequestHandler):
                     self.wfile.write(block)
 
     def do_POST(self) -> None:
+        with self.server.state_lock:  # type: ignore[attr-defined]
+            self._do_post_locked()
+
+    def _do_post_locked(self) -> None:
         try:
             self.authenticate()
             path = urlsplit(self.path).path
@@ -658,7 +676,8 @@ class IntakeHandler(BaseHTTPRequestHandler):
                 raise UploadError(409, "stored candidate has no file path")
             destination = self.root / stored_path
             if (stored.get("sha256") != actual or stored.get("bytes") != session["bytes"]
-                    or not destination.is_file() or destination.stat().st_size != session["bytes"]):
+                    or not destination.is_file() or destination.stat().st_size != session["bytes"]
+                    or not hmac.compare_digest(file_sha256(destination), actual)):
                 raise UploadError(409, "stored candidate does not match the completed upload")
             candidate["object_path"] = str(object_path.relative_to(self.root))
             duplicate = True
@@ -693,7 +712,7 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
     root = Path(__file__).resolve().parents[1]
-    server = HTTPServer((args.host, args.port), IntakeHandler)
+    server = IntakeServer((args.host, args.port), IntakeHandler)
     server.root = root  # type: ignore[attr-defined]
     server.catalog = load_catalog(root)  # type: ignore[attr-defined]
     server.token = intake_token(root)  # type: ignore[attr-defined]
