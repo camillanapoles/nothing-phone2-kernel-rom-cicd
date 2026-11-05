@@ -370,6 +370,8 @@ jobs:
           v = next(x for x in rom['variants'] if x['id'] == 'vanilla')
           boot = out / 'boot.img'
           assert boot.is_file() and boot.stat().st_size > 0, 'boot.img missing'
+          dtbo = out / 'dtbo.img'
+          assert dtbo.is_file() and dtbo.stat().st_size > 0, 'dtbo.img missing or empty'
           with boot.open('rb') as f:
               header = f.read(48)
           assert header[:8] == b'ANDROID!', header[:8]
@@ -694,7 +696,7 @@ jobs:
           lto_mode = plan['build']['lto']
           lto_configs = {'full': 'CONFIG_LTO_CLANG_FULL', 'thin': 'CONFIG_LTO_CLANG_THIN'}
           assert lto_mode in lto_configs, f'Unsupported reviewed LTO mode: {lto_mode}'
-          required += ['CONFIG_MODULES', 'CONFIG_MODULE_UNLOAD', 'CONFIG_KPROBES', 'CONFIG_CFI_CLANG', lto_configs[lto_mode]]
+          required += ['CONFIG_MODULES', 'CONFIG_MODULE_UNLOAD', 'CONFIG_KPROBES', 'CONFIG_CFI_CLANG', 'CONFIG_DRM_MSM', lto_configs[lto_mode]]
           required = sorted(set(required))
           target = pathlib.Path('kernel-source/arch/arm64/configs/evox_pong_pack_ci.config')
           target.write_text('# Generated from objects/kernel-build-plan.json; see kernel-config-expectations.json\n' + ''.join(f'{name}=y\n' for name in required))
@@ -1136,6 +1138,7 @@ jobs:
             !candidate/susfs-lkm-loader
 
       - name: Attest kernel artifacts by digest
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: |
@@ -1199,12 +1202,13 @@ jobs:
           set -Eeuo pipefail
           mkdir -p evidence/automated logs/device
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, subprocess, sys, time
+          import hashlib, itertools, json, os, pathlib, re, subprocess, sys, time
           root = pathlib.Path('.')
           out = root / 'evidence/automated'
           serial = os.environ.get('DEVICE_SERIAL', '')
           checks = []
           infrastructure = []
+          adb_call_ids = itertools.count(1)
 
           def record(name, status, detail=''):
               checks.append({'id': name, 'status': status, 'detail': detail})
@@ -1224,7 +1228,7 @@ jobs:
               return adb_base(*args, timeout=timeout)
 
           def adb_base(*args, timeout=45):
-              return run('adb', ['adb', '-s', serial, *args], timeout=timeout)
+              return run('adb', ['adb', '-s', serial, *args], log=f'adb-{next(adb_call_ids):04d}.log', timeout=timeout)
 
           def root(command, log, timeout=45):
               return run(log, ['adb', '-s', serial, 'shell', 'su', '-c', command], log=log, timeout=timeout)
@@ -1385,6 +1389,19 @@ jobs:
           errors, statuses = [], {}
           valid = False
           complete = False
+          automated_source = pathlib.Path('evidence/automated')
+          banned_names = re.compile(r'(^|/)(keybox\.xml|[^/]*\.(pem|key|p12|jks|keystore))$', re.I)
+          secret_pattern = re.compile(rb'BEGIN [A-Z ]*PRIVATE KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+')
+          try:
+              automated_files = [p for p in automated_source.rglob('*') if p.is_file() or p.is_symlink()]
+              assert not any(p.is_symlink() for p in automated_files), 'automated evidence symlinks are forbidden'
+              for path in automated_files:
+                  rel = path.relative_to(automated_source).as_posix()
+                  assert not banned_names.search(rel), f'forbidden secret file in automated evidence: {rel}'
+                  assert not secret_pattern.search(path.read_bytes()), f'possible secret in automated evidence: {rel}'
+          except Exception as exc:
+              shutil.rmtree(automated_source, ignore_errors=True)
+              errors.append(f'automated evidence withheld before upload: {exc}')
           try:
               results_path = source / 'manual-results.json'
               data = json.loads(results_path.read_text())
@@ -1407,13 +1424,10 @@ jobs:
               assert not any(p.is_symlink() for p in files), 'symlinks are forbidden'
               assert len(files) <= 500, 'too many evidence files'
               assert sum(p.stat().st_size for p in files) <= 512 * 1024 * 1024, 'evidence exceeds 512 MiB'
-              banned_names = re.compile(r'(^|/)(keybox\.xml|[^/]*\.(pem|key|p12|jks|keystore))$', re.I)
-              secret_pattern = re.compile(rb'BEGIN [A-Z ]*PRIVATE KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+')
               for path in files:
                   rel = path.relative_to(source).as_posix()
                   assert not banned_names.search(rel), f'forbidden secret file: {rel}'
-                  if path.stat().st_size <= 5 * 1024 * 1024:
-                      assert not secret_pattern.search(path.read_bytes()), f'possible secret in {rel}'
+                  assert not secret_pattern.search(path.read_bytes()), f'possible secret in {rel}'
               sums = source / 'SHA256SUMS'
               assert sums in files, 'SHA256SUMS is required'
               expected = {}
@@ -1422,7 +1436,7 @@ jobs:
                   assert re.fullmatch(r'[0-9a-f]{64}', digest)
                   assert rel not in expected
                   expected[rel] = digest
-              actual_files = {p.relative_to(source).as_posix(): p for p in files if p.name != 'SHA256SUMS'}
+              actual_files = {p.relative_to(source).as_posix(): p for p in files if p != sums}
               assert set(expected) == set(actual_files), 'SHA256SUMS must cover every evidence file except itself'
               for rel, path in actual_files.items():
                   assert hashlib.sha256(path.read_bytes()).hexdigest() == expected[rel], f'hash mismatch: {rel}'
@@ -1531,7 +1545,7 @@ jobs:
           manual = load('evidence/manual-report.json', {'complete': False, 'errors': ['no device/manual evidence']})
           build = os.environ['KERNEL_RESULT'] == 'success'
           collected = os.environ['COLLECT_RESULT'] == 'success' and os.environ['COLLECT_COMPLETE'] == 'true' and collection.get('complete') is True
-          device = automated.get('all_passed') is True
+          device = os.environ['DEVICE_RESULT'] == 'success' and automated.get('all_passed') is True
           manual_complete = manual.get('complete') is True
           complete = build and collected and device and manual_complete
           pending = []

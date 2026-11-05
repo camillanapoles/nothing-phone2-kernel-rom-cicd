@@ -25,6 +25,9 @@ from urllib.parse import parse_qs, urlsplit
 SCHEMA = "pong-intake-candidate/1"
 MAX_METADATA = 16384
 MIRROR_TTL_SECONDS = 24 * 60 * 60
+UPLOAD_SESSION_IDLE_SECONDS = 30 * 60
+PRIVATE_FILENAME_PATTERN = re.compile(r"(?:keybox\.xml|[^/]*\.(?:pem|key|p12|jks|keystore))", re.I)
+PRIVATE_KEY_PATTERN = re.compile(rb"BEGIN [A-Z ]*PRIVATE KEY")
 
 
 def load_catalog(root: Path) -> list[dict]:
@@ -94,6 +97,7 @@ def intake_token(root: Path) -> str:
     if path.exists():
         token = path.read_text().strip()
         if len(token) >= 16:
+            path.chmod(0o600)
             return token
     token = secrets.token_urlsafe(24)
     path.write_text(token + "\n")
@@ -109,6 +113,18 @@ def safe_filename(value: str) -> str:
     if any(ord(char) < 32 for char in value) or not re.fullmatch(r"[A-Za-z0-9._+() @-]+", value):
         raise ValueError("filename contains unsupported characters")
     return value
+
+
+def normalize_public_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("public origin has an invalid port") from error
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("public origin must be an HTTPS origin without credentials, path, query, or fragment")
+    return value.rstrip("/")
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -139,6 +155,21 @@ class UploadError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def reject_private_filename(filename: str) -> None:
+    if PRIVATE_FILENAME_PATTERN.fullmatch(filename):
+        raise UploadError(400, "private key material is forbidden in this intake")
+
+
+def reject_private_key_content(path: Path) -> None:
+    tail = b""
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            data = tail + block
+            if PRIVATE_KEY_PATTERN.search(data):
+                raise UploadError(422, "private key marker detected; upload deleted")
+            tail = data[-128:]
 
 
 def metadata_from_values(catalog: list[dict], values: dict) -> tuple[dict, str, str, str]:
@@ -172,23 +203,51 @@ def store_candidate(
         raise UploadError(422, f"SHA256 mismatch: expected {expected}, got {actual}; upload deleted")
 
     intake = root / ".intake"
+    object_path = intake / "objects" / asset["intake_id"].replace(":", "/") / f"{actual}.json"
+    status = "HASH_MATCH_PENDING_REVIEW" if expected else "PENDING_REVIEW"
+    asset_view = {key: asset[key] for key in ("intake_id", "asset_id", "kind", "required", "pin", "source")}
+    if object_path.exists():
+        candidate = json.loads(object_path.read_text())
+        if candidate.get("file", {}).get("sha256") != actual:
+            raise UploadError(409, "candidate object collision")
+        stored_path = candidate.get("file", {}).get("path")
+        if not stored_path:
+            raise UploadError(409, "stored candidate has no file path")
+        destination = root / stored_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if not destination.is_file() or destination.stat().st_size != length:
+                raise UploadError(409, "content-addressed destination collision")
+            part_path.unlink(missing_ok=True)
+        else:
+            os.replace(part_path, destination)
+        candidate["status"] = status
+        candidate["asset"] = asset_view
+        candidate["file"].update({
+            "bytes": length, "sha256": actual,
+            "expected_sha256": expected, "hash_match": bool(expected) if expected else None,
+        })
+        candidate["duplicate_content"] = True
+        atomic_json(object_path, candidate)
+        candidate["object_path"] = str(object_path.relative_to(root))
+        return candidate, True, destination
+
     destination_dir = intake / "files" / asset["intake_id"].replace(":", "/") / actual
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / filename
     duplicate = destination.exists()
     if duplicate:
-        if destination.stat().st_size != length:
+        if not destination.is_file() or destination.stat().st_size != length:
             raise UploadError(409, "content-addressed destination collision")
         part_path.unlink(missing_ok=True)
     else:
         os.replace(part_path, destination)
 
-    object_path = intake / "objects" / asset["intake_id"].replace(":", "/") / f"{actual}.json"
     candidate = {
         "schema": SCHEMA,
-        "status": "HASH_MATCH_PENDING_REVIEW" if expected else "PENDING_REVIEW",
+        "status": status,
         "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "asset": {key: asset[key] for key in ("intake_id", "asset_id", "kind", "required", "pin", "source")},
+        "asset": asset_view,
         "file": {
             "filename": filename, "bytes": length, "sha256": actual,
             "path": str(destination.relative_to(root)),
@@ -203,19 +262,12 @@ def store_candidate(
         },
         "duplicate_content": duplicate,
     }
-    if object_path.exists():
-        previous = json.loads(object_path.read_text())
-        if previous.get("file", {}).get("sha256") != actual:
-            raise UploadError(409, "candidate object collision")
-        candidate = previous
-        candidate["duplicate_content"] = True
-    else:
-        atomic_json(object_path, candidate)
+    atomic_json(object_path, candidate)
     candidate["object_path"] = str(object_path.relative_to(root))
     return candidate, duplicate, destination
 
 
-def create_mirror(root: Path, upload_id: str, asset: dict, candidate: dict, destination: Path) -> dict | None:
+def create_mirror(root: Path, upload_id: str, asset: dict, candidate: dict, destination: Path, public_origin: str) -> dict | None:
     actual = candidate["file"]["sha256"]
     if asset["intake_id"] != "rom:vanilla" or not asset.get("expected_sha256"):
         return None
@@ -230,8 +282,10 @@ def create_mirror(root: Path, upload_id: str, asset: dict, candidate: dict, dest
         "expires_at": expires_at,
     }
     atomic_json(root / ".intake/mirrors" / f"{upload_id}.json", record)
+    mirror_path = f"/mirror/{upload_id}?key={key}"
     return {
-        "mirror_path": f"/mirror/{upload_id}?key={key}",
+        "mirror_path": mirror_path,
+        "mirror_url": public_origin + mirror_path,
         "mirror_expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at)),
     }
 
@@ -259,7 +313,7 @@ function show(text){$('result').textContent=text}
 function errorFrom(status,text){try{const x=JSON.parse(text);return new Error(x.error||`HTTP ${status}`)}catch{return new Error(`HTTP ${status}: resposta não JSON do proxy ou servidor`)}}
 async function api(url,options){const r=await fetch(url,options);const text=await r.text();if(!r.ok){const e=errorFrom(r.status,text);e.status=r.status;throw e}return JSON.parse(text)}
 function downloadObject(){if(!lastObject)return;const blob=new Blob([JSON.stringify(lastObject,null,2)+'\n'],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${lastObject.asset.intake_id.replaceAll(':','-')}-${lastObject.file.sha256.slice(0,12)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
-function success(data){lastObject=data.object;show('Objeto candidato criado (não canônico):\n'+JSON.stringify(data.object,null,2));const b=document.createElement('button');b.textContent='Baixar objeto JSON';b.onclick=downloadObject;$('result').appendChild(document.createElement('br')); $('result').appendChild(b);if(data.mirror_path){const url=location.origin+data.mirror_path;const label=document.createElement('label');label.textContent='ROM_MIRROR_URL temporária (expira '+data.mirror_expires_at+')';const input=document.createElement('input');input.readOnly=true;input.value=url;const copy=document.createElement('button');copy.textContent='Copiar URL do mirror';copy.onclick=async()=>{input.select();try{await navigator.clipboard.writeText(url)}catch{document.execCommand('copy')}};$('result').appendChild(label);$('result').appendChild(input);$('result').appendChild(copy);const note=document.createElement('p');note.textContent='Envie esta URL completa para continuar o CI. Ela não altera o SHA256 exigido nem autoriza release.';$('result').appendChild(note)}}
+function success(data){lastObject=data.object;show('Objeto candidato criado (não canônico):\n'+JSON.stringify(data.object,null,2));const b=document.createElement('button');b.textContent='Baixar objeto JSON';b.onclick=downloadObject;$('result').appendChild(document.createElement('br')); $('result').appendChild(b);if(data.mirror_url){const url=data.mirror_url;const label=document.createElement('label');label.textContent='ROM_MIRROR_URL temporária (expira '+data.mirror_expires_at+')';const input=document.createElement('input');input.readOnly=true;input.value=url;const copy=document.createElement('button');copy.textContent='Copiar URL do mirror';copy.onclick=async()=>{input.select();try{await navigator.clipboard.writeText(url)}catch{document.execCommand('copy')}};$('result').appendChild(label);$('result').appendChild(input);$('result').appendChild(copy);const note=document.createElement('p');note.textContent='Envie esta URL completa para continuar o CI. Ela não altera o SHA256 exigido nem autoriza release.';$('result').appendChild(note)}}
 function chunkRequest(id,index,blob,hash,offset,total){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST',`/api/upload/chunk?id=${id}&index=${index}`);x.setRequestHeader('X-Intake-Token',$('token').value);x.setRequestHeader('X-Chunk-SHA256',hash);x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable){$('progress').value=(offset+e.loaded)/total*100;show(`Enviando… ${Math.floor((offset+e.loaded)/total*100)}% · parte ${index+1}`)}};x.onload=()=>{if(x.status>=200&&x.status<300){try{resolve(JSON.parse(x.responseText))}catch{reject(new Error('Resposta JSON inválida do servidor'))}}else{const e=errorFrom(x.status,x.responseText);e.status=x.status;reject(e)}};x.onerror=()=>reject(new Error('falha de rede no envio da parte'));x.send(blob)})}
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function retry(operation){let last;for(let attempt=1;attempt<=5;attempt++){try{return await operation()}catch(e){last=e;if(attempt===5||(e.status>=400&&e.status<500&&e.status!==408&&e.status!==429))throw e;await pause(attempt*1000)}}throw last}
@@ -271,6 +325,7 @@ load().catch(e=>show(e.message));
 
 class IntakeHandler(BaseHTTPRequestHandler):
     server_version = "PongIntake/2"
+    timeout = 30
 
     @property
     def root(self) -> Path:
@@ -331,6 +386,54 @@ class IntakeHandler(BaseHTTPRequestHandler):
         if not path.is_file():
             raise UploadError(404, "upload session not found or expired")
         return directory, json.loads(path.read_text())
+
+    def expire_abandoned_sessions(self) -> None:
+        sessions = self.root / ".intake/sessions"
+        if not sessions.is_dir():
+            return
+        now = time.time()
+        for directory in sessions.iterdir():
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            try:
+                session = json.loads((directory / "session.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if session.get("status") not in {"receiving", "storing"}:
+                continue
+            last_activity = session.get("last_activity", session.get("created_at"))
+            if isinstance(last_activity, bool) or not isinstance(last_activity, (int, float)):
+                continue
+            if now - last_activity > UPLOAD_SESSION_IDLE_SECONDS:
+                shutil.rmtree(directory)
+
+    def reserved_session_bytes(self) -> int:
+        sessions = self.root / ".intake/sessions"
+        if not sessions.is_dir():
+            return 0
+        reserved = 0
+        for directory in sessions.iterdir():
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            try:
+                session = json.loads((directory / "session.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if session.get("status") not in {"receiving", "storing"}:
+                continue
+            size = session.get("bytes")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                continue
+            received = 0
+            for marker in (directory / "chunks").glob("*.json"):
+                try:
+                    length = json.loads(marker.read_text()).get("bytes")
+                    if not isinstance(length, bool) and isinstance(length, int) and length > 0:
+                        received += length
+                except (OSError, ValueError):
+                    pass
+            reserved += max(0, size - received)
+        return reserved
 
     def do_HEAD(self) -> None:
         self.do_GET()
@@ -422,14 +525,18 @@ class IntakeHandler(BaseHTTPRequestHandler):
     def upload_init(self) -> None:
         values = self.read_json()
         asset, filename, source_url, note = metadata_from_values(self.catalog, values)
+        reject_private_filename(filename)
         size = values.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise UploadError(400, "size must be a positive integer")
         if size > self.server.max_bytes:  # type: ignore[attr-defined]
             raise UploadError(413, f"file exceeds the {self.server.max_bytes} byte intake limit")  # type: ignore[attr-defined]
         intake = self.root / ".intake"
-        if shutil.disk_usage(intake).free < size + 1024 ** 3:
-            raise UploadError(507, "insufficient disk space while preserving the 1 GiB safety reserve")
+        intake.mkdir(parents=True, exist_ok=True)
+        self.expire_abandoned_sessions()
+        reserved = self.reserved_session_bytes()
+        if shutil.disk_usage(intake).free < size + reserved + 1024 ** 3:
+            raise UploadError(507, "insufficient disk space for active uploads while preserving the 1 GiB safety reserve")
         upload_id = secrets.token_hex(16)
         directory = self.session_dir(upload_id)
         (directory / "chunks").mkdir(parents=True, exist_ok=False)
@@ -441,7 +548,7 @@ class IntakeHandler(BaseHTTPRequestHandler):
             "asset": asset["intake_id"], "filename": filename,
             "source_url": source_url, "note": note, "bytes": size,
             "chunk_size": chunk_size, "chunks_total": (size + chunk_size - 1) // chunk_size,
-            "status": "receiving", "created_at": int(time.time()),
+            "status": "receiving", "created_at": int(time.time()), "last_activity": int(time.time()),
         }
         atomic_json(directory / "session.json", session)
         self.send_json(201, {"upload_id": upload_id, "chunk_size": chunk_size, "chunks_total": session["chunks_total"]})
@@ -489,6 +596,8 @@ class IntakeHandler(BaseHTTPRequestHandler):
         finally:
             os.close(fd)
         atomic_json(directory / "chunks" / f"{index:08d}.json", {"sha256": actual_hash, "bytes": length})
+        session["last_activity"] = int(time.time())
+        atomic_json(directory / "session.json", session)
         received = len(list((directory / "chunks").glob("*.json")))
         self.send_json(200, {"index": index, "received": received, "chunks_total": session["chunks_total"]})
 
@@ -500,7 +609,7 @@ class IntakeHandler(BaseHTTPRequestHandler):
         if result_path.is_file():
             self.send_json(200, json.loads(result_path.read_text()))
             return
-        if session["status"] != "receiving":
+        if session["status"] not in {"receiving", "storing"}:
             raise UploadError(409, "upload session is not completable")
         missing = []
         for index in range(session["chunks_total"]):
@@ -515,22 +624,46 @@ class IntakeHandler(BaseHTTPRequestHandler):
         if missing:
             raise UploadError(409, f"upload is incomplete; missing chunks: {missing[:20]}")
         part_path = directory / "data.part"
-        if not part_path.is_file() or part_path.stat().st_size != session["bytes"]:
-            raise UploadError(409, "assembled upload has the wrong size")
         asset = next(item for item in self.catalog if item["intake_id"] == session["asset"])
-        actual = file_sha256(part_path)
-        try:
-            candidate, duplicate, destination = store_candidate(
-                self.root, asset, session["filename"], session["source_url"], session["note"],
-                part_path, session["bytes"], actual,
-                {"mode": "chunked", "chunk_size": session["chunk_size"], "chunks": session["chunks_total"]},
-            )
-        except UploadError:
-            session["status"] = "rejected"
+        if part_path.is_file():
+            if part_path.stat().st_size != session["bytes"]:
+                raise UploadError(409, "assembled upload has the wrong size")
+            actual = file_sha256(part_path)
+            session["status"] = "storing"
+            session["actual_sha256"] = actual
             atomic_json(directory / "session.json", session)
-            raise
+            try:
+                reject_private_key_content(part_path)
+                candidate, duplicate, destination = store_candidate(
+                    self.root, asset, session["filename"], session["source_url"], session["note"],
+                    part_path, session["bytes"], actual,
+                    {"mode": "chunked", "chunk_size": session["chunk_size"], "chunks": session["chunks_total"]},
+                )
+            except UploadError:
+                part_path.unlink(missing_ok=True)
+                session["status"] = "rejected"
+                atomic_json(directory / "session.json", session)
+                raise
+        else:
+            actual = session.get("actual_sha256")
+            if not isinstance(actual, str) or not re.fullmatch(r"[0-9a-f]{64}", actual):
+                raise UploadError(409, "assembled upload has the wrong size")
+            object_path = self.root / ".intake/objects" / asset["intake_id"].replace(":", "/") / f"{actual}.json"
+            if not object_path.is_file():
+                raise UploadError(409, "stored candidate is unavailable; completion cannot be recovered")
+            candidate = json.loads(object_path.read_text())
+            stored = candidate.get("file", {})
+            stored_path = stored.get("path")
+            if not stored_path:
+                raise UploadError(409, "stored candidate has no file path")
+            destination = self.root / stored_path
+            if (stored.get("sha256") != actual or stored.get("bytes") != session["bytes"]
+                    or not destination.is_file() or destination.stat().st_size != session["bytes"]):
+                raise UploadError(409, "stored candidate does not match the completed upload")
+            candidate["object_path"] = str(object_path.relative_to(self.root))
+            duplicate = True
         response = {"object": candidate}
-        mirror = create_mirror(self.root, upload_id, asset, candidate, destination)
+        mirror = create_mirror(self.root, upload_id, asset, candidate, destination, self.server.public_origin)  # type: ignore[attr-defined]
         if mirror:
             response.update(mirror)
         atomic_json(result_path, response)
@@ -546,16 +679,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--public-origin", default=os.environ.get("INTAKE_PUBLIC_ORIGIN"),
+                        help="runner-reachable HTTPS origin (or set INTAKE_PUBLIC_ORIGIN)")
     parser.add_argument("--max-gib", type=float, default=4.0)
     parser.add_argument("--chunk-size", type=int, default=8 * 1024 * 1024)
     args = parser.parse_args()
     if args.chunk_size < 1024 * 1024 or args.chunk_size > 16 * 1024 * 1024:
         parser.error("--chunk-size must be between 1 MiB and 16 MiB")
+    if not args.public_origin:
+        parser.error("--public-origin or INTAKE_PUBLIC_ORIGIN is required for a runner-reachable HTTPS mirror URL")
+    try:
+        public_origin = normalize_public_origin(args.public_origin)
+    except ValueError as error:
+        parser.error(str(error))
     root = Path(__file__).resolve().parents[1]
     server = HTTPServer((args.host, args.port), IntakeHandler)
     server.root = root  # type: ignore[attr-defined]
     server.catalog = load_catalog(root)  # type: ignore[attr-defined]
     server.token = intake_token(root)  # type: ignore[attr-defined]
+    server.public_origin = public_origin  # type: ignore[attr-defined]
     server.max_bytes = int(args.max_gib * 1024 ** 3)  # type: ignore[attr-defined]
     server.chunk_size = args.chunk_size  # type: ignore[attr-defined]
     print(f"Pong intake listening on {args.host}:{args.port}; {len(server.catalog)} catalog entries; chunks {args.chunk_size} bytes; token in .intake/token", flush=True)  # type: ignore[attr-defined]
