@@ -70,6 +70,8 @@ env:
   CLANG_REPOSITORY_COMMIT: ec94f3f5fb2a058e326746cdea7bb009511e72cd
   CLANG_ARCHIVE_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/ec94f3f5fb2a058e326746cdea7bb009511e72cd/clang-r530567.tar.gz
   ANYKERNEL3_COMMIT: 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+  AIK_COMMIT: 4ac321dfd48e16344e6146c505708aa720ff0bb3
+  MAGISKBOOT_X86_SHA256: c5988917e56285c03892db3ad5da71d986dfbc2e55f78e04646059c2918754da
   PAYLOAD_DUMPER_COMMIT: eb13ef8f181077b69c9e39703e96dc3ad0bbfd96
   KERNEL_ACTION_COMMIT: c61fc39e72624a641caf23b71660aa4de2bff036
   KBUILD_BUILD_USER: pong-ci
@@ -718,18 +720,22 @@ jobs:
           set -Eeuo pipefail
           echo "KBUILD_BUILD_TIMESTAMP=$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
 
-      - name: Serve the verified stock boot locally to the packaging action
+      - name: Prepare pinned packaging sources
         run: |
           set -Eeuo pipefail
-          python3 -m http.server 18765 --bind 127.0.0.1 --directory collection/rom/vanilla/extracted > logs/kernel/local-http.log 2>&1 &
-          echo $! > "$RUNNER_TEMP/pong-http.pid"
-          for _ in $(seq 1 30); do
-            if curl -fsI http://127.0.0.1:18765/boot.img; then exit 0; fi
-            sleep 1
-          done
-          exit 1
+          git clone --filter=blob:none --no-checkout https://github.com/osm0sis/AnyKernel3.git work/AnyKernel3
+          git -C work/AnyKernel3 checkout --detach "$ANYKERNEL3_COMMIT"
+          test "$(git -C work/AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL3_COMMIT"
+          git clone --filter=blob:none --no-checkout https://github.com/Shubhamvis98/AIK.git work/AIK
+          git -C work/AIK sparse-checkout set --no-cone /bin/magiskboot_x86
+          git -C work/AIK checkout --detach "$AIK_COMMIT"
+          test "$(git -C work/AIK rev-parse HEAD)" = "$AIK_COMMIT"
+          printf '%s  %s\n' "$MAGISKBOOT_X86_SHA256" "$PWD/work/AIK/bin/magiskboot_x86" | sha256sum -c -
+          mkdir -p work/packaging
+          cp work/AIK/bin/magiskboot_x86 work/packaging/magiskboot
+          chmod 0755 work/packaging/magiskboot
 
-      - name: Build and repack with the pinned Marketplace action
+      - name: Build kernel with the pinned Marketplace action
         id: marketplace_build
         timeout-minutes: 95
         uses: dabao1955/kernel_build_action@c61fc39e72624a641caf23b71660aa4de2bff036
@@ -747,15 +753,77 @@ jobs:
           merge-configs: '["arch/arm64/configs/vendor/waipio_GKI.config","arch/arm64/configs/vendor/nothing/waipio_GKI.config","arch/arm64/configs/vendor/debugfs.config","arch/arm64/configs/evox_pong_pack_ci.config"]'
           disable-lto: false
           ccache: true
-          anykernel3: false
-          bootimg-url: http://127.0.0.1:18765/boot.img
+          # Its bootimg mode uses split/boot.img relative to cwd=split; stage AnyKernel3 instead.
+          anykernel3: true
+          anykernel3-url: ${{ github.workspace }}/work/AnyKernel3
           release: false
           extra-make-args: '[]'
 
-      - name: Stop the local stock-image server
-        if: always()
+      - name: Repack stock boot locally with absolute paths
         run: |
-          if test -f "$RUNNER_TEMP/pong-http.pid"; then kill "$(cat "$RUNNER_TEMP/pong-http.pid")" 2>/dev/null || true; fi
+          set -Eeuo pipefail
+          test "$(uname -m)" = x86_64
+          REPACK_DIR="$PWD/work/boot-repack"
+          MAGISKBOOT="$PWD/work/packaging/magiskboot"
+          STOCK_BOOT="$PWD/collection/rom/vanilla/extracted/boot.img"
+          KERNEL_IMAGE="$PWD/kernel-source/out/arch/arm64/boot/Image"
+          OUTPUT_BOOT="$PWD/build/boot.img"
+          test -s "$MAGISKBOOT"
+          test -s "$STOCK_BOOT"
+          test -s "$KERNEL_IMAGE"
+          printf '%s  %s\n' "$MAGISKBOOT_X86_SHA256" "$MAGISKBOOT" | sha256sum -c -
+          rm -rf "$REPACK_DIR"
+          mkdir -p "$REPACK_DIR" "$PWD/build"
+          (
+            cd "$REPACK_DIR"
+            "$MAGISKBOOT" unpack -h "$STOCK_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-unpack.log
+          rm -f "$REPACK_DIR/kernel"
+          cp "$KERNEL_IMAGE" "$REPACK_DIR/kernel"
+          (
+            cd "$REPACK_DIR"
+            "$MAGISKBOOT" repack "$STOCK_BOOT" "$OUTPUT_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-repack.log
+          test -s "$OUTPUT_BOOT"
+          VERIFY_DIR="$PWD/work/boot-verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          (
+            cd "$VERIFY_DIR"
+            "$MAGISKBOOT" unpack "$OUTPUT_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-verify-unpack.log
+          cmp "$VERIFY_DIR/kernel" "$KERNEL_IMAGE"
+          STOCK_BOOT="$STOCK_BOOT" OUTPUT_BOOT="$OUTPUT_BOOT" python3 - <<'PY'
+          import hashlib, json, os, pathlib, struct
+          stock = pathlib.Path(os.environ['STOCK_BOOT'])
+          output = pathlib.Path(os.environ['OUTPUT_BOOT'])
+          def header_version(path):
+              with path.open('rb') as handle:
+                  header = handle.read(48)
+              assert len(header) == 48 and header[:8] == b'ANDROID!', f'invalid Android boot header: {path}'
+              version = struct.unpack_from('<I', header, 40)[0]
+              assert 0 <= version <= 4, (path, version)
+              return version
+          stock_version = header_version(stock)
+          output_version = header_version(output)
+          assert output_version == stock_version, (stock_version, output_version)
+          stock_bytes = stock.stat().st_size
+          output_bytes = output.stat().st_size
+          assert output_bytes * 100 <= stock_bytes * 105, f'boot.img exceeds stock + 5%: {stock_bytes} -> {output_bytes}'
+          report = {
+              'schema': 'pong-boot-repack/1', 'status': 'PASS',
+              'stock': {'bytes': stock_bytes, 'sha256': hashlib.sha256(stock.read_bytes()).hexdigest(), 'header_version': stock_version},
+              'output': {'bytes': output_bytes, 'sha256': hashlib.sha256(output.read_bytes()).hexdigest(), 'header_version': output_version},
+              'kernel_roundtrip_byte_identical': True,
+              'size_within_stock_plus_5_percent': True,
+              'device_boot_proven': False,
+          }
+          rendered = json.dumps(report, indent=2, sort_keys=True) + '\n'
+          pathlib.Path('candidate/primary/boot-repack.json').write_text(rendered)
+          pathlib.Path('logs/kernel/boot-repack-validation.json').write_text(rendered)
+          print(rendered)
+          PY
+          sha256sum "$STOCK_BOOT" "$KERNEL_IMAGE" "$OUTPUT_BOOT" | tee logs/kernel/boot-repack-hashes.log
 
       - name: Preserve ccache even when a long build fails
         if: ${{ always() && steps.marketplace_build.outcome == 'failure' }}
@@ -925,7 +993,8 @@ jobs:
               long msg = call2(__NR_msgget, IPC_PRIVATE, IPC_CREAT | 0600);
               if (msg < 0) return FAIL("FAIL msgget\n", 13);
               if (call3(__NR_msgctl, msg, IPC_RMID, 0) < 0) return FAIL("FAIL msgctl cleanup\n", 14);
-              static const char queue[] = "/pongci";
+              /* Raw mq syscalls use a slash-free name; libc normally strips the POSIX leading slash. */
+              static const char queue[] = "pongci";
               long mq = call4(__NR_mq_open, (long)queue, O_CREAT | O_EXCL | O_RDWR, 0600, 0);
               if (mq < 0) return FAIL("FAIL mq_open\n", 15);
               if (call1(__NR_mq_unlink, (long)queue) < 0) return FAIL("FAIL mq_unlink\n", 16);
@@ -1010,8 +1079,6 @@ jobs:
       - name: Package pinned Pong AnyKernel3, corresponding source and manifests
         run: |
           set -Eeuo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/osm0sis/AnyKernel3.git work/AnyKernel3
-          git -C work/AnyKernel3 checkout --detach "$ANYKERNEL3_COMMIT"
           test "$(git -C work/AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL3_COMMIT"
           rm -rf work/AnyKernel3/.git
           cp candidate/primary/Image work/AnyKernel3/Image
@@ -1029,8 +1096,9 @@ jobs:
           device.name3=Nothing Phone (2)
           supported.versions=16
           '; }
-          BLOCK=boot;
-          IS_SLOT_DEVICE=1;
+          # The documented manual installer is Slot-A-only; never follow the active slot.
+          BLOCK=boot_a;
+          IS_SLOT_DEVICE=0;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=0;
           . tools/ak3-core.sh;
