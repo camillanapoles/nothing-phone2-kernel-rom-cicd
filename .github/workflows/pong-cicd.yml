@@ -149,6 +149,7 @@ jobs:
           epoch = int(datetime.datetime.fromisoformat(plan['source']['pin_date'].replace('Z', '+00:00')).timestamp())
           files = [
               'kernel/configs/evox_pong_pack.config',
+              'scripts/kernel_link_diagnostics.py',
               'kernel/patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch',
               'kernel/patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch',
           ]
@@ -1092,6 +1093,10 @@ jobs:
           cp kernel-source/out/.config kernel-source/out-repro/.config
           MAKE_ARGS=(ARCH=arm64 CC=clang CROSS_COMPILE="$HOME/gcc-64/bin/aarch64-linux-android-4.9-" CROSS_COMPILE_ARM32="$HOME/gcc-32/bin/arm-linux-androideabi-4.9-" CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 O=out-repro)
           make -C kernel-source "${MAKE_ARGS[@]}" olddefconfig
+          # Separate config/prepare and the previously implicated translation unit
+          # from the expensive final build, without changing FullLTO or hardening.
+          make -C kernel-source "${MAKE_ARGS[@]}" prepare 2>&1 | tee logs/kernel/repro-prepare.log
+          make -C kernel-source "${MAKE_ARGS[@]}" V=1 init/main.o 2>&1 | tee logs/kernel/repro-init-main.log
           make -C kernel-source "${MAKE_ARGS[@]}" -j"$(nproc)" all 2>&1 | tee logs/kernel/build-repro.log
           sha256sum candidate/primary/Image kernel-source/out-repro/arch/arm64/boot/Image candidate/primary/evox_pong_pack.config kernel-source/out-repro/.config | tee logs/kernel/repro-hashes.log
           cmp candidate/primary/Image kernel-source/out-repro/arch/arm64/boot/Image
@@ -1184,6 +1189,7 @@ jobs:
           for path in kernel-source/out/build.log kernel-source/out/.config kernel-source/out-repro/.config; do
             test ! -f "$path" || cp "$path" "logs/kernel/salvage-$(echo "$path" | tr '/.' '__')"
           done
+          python3 scripts/kernel_link_diagnostics.py > logs/kernel/link-diagnostics.log 2>&1
           git -C kernel-source status --short > logs/kernel/final-source-status.log 2>&1
           python3 - <<'PY'
           import os, pathlib, re
