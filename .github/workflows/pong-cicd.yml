@@ -1,0 +1,1906 @@
+---
+# Pong / Evolution X 11.11 — one JSON-driven, fail-closed pipeline.
+#
+# External guidance reviewed: ECC /plan-orchestrate and /github-ops. Those are
+# documents, not installed slash-commands in this repository or runner.
+#
+# Engineering decision (2026-11-04): the official SUSFS kernel-side patch is
+# not forced onto KernelSU-Next. Its KSU-side patch does not apply to v3.4.2.
+# This pipeline embeds official KernelSU-Next v3.4.2 and builds the SUSFS
+# 2.3.0-gki LKM from that same tag. The R28 userspace module is collected
+# separately. Build success is never treated as device/staging success.
+#
+# Release-only cycle: no fastboot flash, adb sideload, slot change, or
+# production deployment exists in this workflow. A draft RC is possible only
+# after automated device smoke plus all M01–M15 manual evidence report PASS.
+
+name: Pong EvoX 11.11 · single fail-closed CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rom_mirror_url:
+        description: Optional HTTPS mirror of the exact pinned Vanilla ZIP; canonical SHA256 is still enforced
+        required: false
+        default: ""
+        type: string
+      run_device_tests:
+        description: Run read-only smoke on an already staged self-hosted Pong
+        required: true
+        default: false
+        type: boolean
+      publish_release_candidate:
+        description: Create a DRAFT RC only after complete staging evidence
+        required: true
+        default: false
+        type: boolean
+      device_serial:
+        description: Optional ADB serial; never a secret
+        required: false
+        default: ""
+        type: string
+      manual_evidence_dir:
+        description: Absolute, redacted M01–M15 evidence directory on the staging runner
+        required: false
+        default: /opt/pong-staging/evidence
+        type: string
+
+concurrency:
+  # Head-SHA groups isolate revisions; never throw away a long kernel build on a duplicate event.
+  group: pong-cicd-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Input/repository variable can override this public, user-supplied Drive mirror.
+  # Drive metadata matched the canonical filename and MD5 on 2026-11-04; final SHA256 is still mandatory.
+  ROM_MIRROR_URL: ${{ inputs.rom_mirror_url || vars.PONG_ROM_MIRROR_URL || 'https://drive.usercontent.google.com/download?id=140FFpYu-5pnhPQJL9u2NLejNmC9O5Jfo&export=download&confirm=t' }}
+  KERNEL_COMMIT: 4ec5491f6b5fd8776207a2a453d6b98b1928de7a
+  KSU_COMMIT: 4c706b5938665866ebe16944a481a7b91e3396af
+  KSU_VERSION: v3.4.2
+  SUSFS_LKM_VERSION: 2.3.0-gki
+  SUSFS_API_VERSION: v2.3.0
+  SUSFS_R28_COMMIT: d30974d4d6356cba1c322f8826b5fd7df904a4b9
+  CLANG_REPOSITORY_COMMIT: ec94f3f5fb2a058e326746cdea7bb009511e72cd
+  CLANG_ARCHIVE_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/ec94f3f5fb2a058e326746cdea7bb009511e72cd/clang-r530567.tar.gz
+  ANYKERNEL3_COMMIT: 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+  AIK_COMMIT: 4ac321dfd48e16344e6146c505708aa720ff0bb3
+  MAGISKBOOT_X86_SHA256: c5988917e56285c03892db3ad5da71d986dfbc2e55f78e04646059c2918754da
+  PAYLOAD_DUMPER_COMMIT: eb13ef8f181077b69c9e39703e96dc3ad0bbfd96
+  KERNEL_ACTION_COMMIT: c61fc39e72624a641caf23b71660aa4de2bff036
+  KBUILD_BUILD_USER: pong-ci
+  KBUILD_BUILD_HOST: github-actions
+  KBUILD_BUILD_VERSION: "1"
+  LLVM: "1"
+  LLVM_IAS: "1"
+
+jobs:
+  stack-governance:
+    name: stack-governance · contracts, pins and run identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+      kernel_fingerprint: ${{ steps.identity.outputs.kernel_fingerprint }}
+      collection_fingerprint: ${{ steps.identity.outputs.collection_fingerprint }}
+    steps:
+      - name: Checkout governance inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run canonical structural gates
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs/governance collection/manifests
+          python3 scripts/stack_gate.py --config objects/install-stack.json 2>&1 | tee logs/governance/stack-gate.log
+          python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json 2>&1 | tee logs/governance/kernel-build-gate.log
+          (cd kernel/patches && sha256sum -c SHA256SUMS) 2>&1 | tee logs/governance/patch-hashes.log
+
+      - name: Audit the single workflow and action pins
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY' 2>&1 | tee logs/governance/workflow-audit.log
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('.')
+          workflows = sorted(set((root / '.github/workflows').glob('*.yml')) | set((root / '.github/workflows').glob('*.yaml')))
+          assert workflows == [root / '.github/workflows/pong-cicd.yml'], workflows
+          text = workflows[0].read_text()
+          uses = re.findall(r'^\s*-?\s*uses:\s*([^\s#]+)', text, re.M)
+          assert uses, 'no actions found'
+          bad = [u for u in uses if not re.search(r'@[0-9a-f]{40}$', u)]
+          assert not bad, f'unpinned actions: {bad}'
+          assert f'dabao1955/kernel_build_action@{__import__("os").environ["KERNEL_ACTION_COMMIT"]}' in uses
+          forbidden = [r'fastboot\s+flash', r'adb\s+[^\n]*sideload', r'fastboot\s+--set-active', r'fastboot\s+set_active']
+          executable_text = '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+          for pattern in forbidden:
+              assert not re.search(pattern, executable_text), f'deployment operation found: {pattern}'
+          plan = json.loads((root / 'objects/kernel-build-plan.json').read_text())
+          rom = json.loads((root / 'objects/rom-artifacts.json').read_text())
+          assert plan['source']['pin'] == __import__('os').environ['KERNEL_COMMIT']
+          assert plan['target']['device'] == 'pong'
+          assert plan['target']['kmi'] == 'android13-5.10'
+          vanilla = next(v for v in rom['variants'] if v['id'] == 'vanilla')
+          assert vanilla['version' if 'version' in vanilla else 'id'] == 'vanilla'
+          assert re.fullmatch(r'[0-9a-f]{64}', vanilla['sha256'])
+          for patch in plan['build']['patch_set'][:2]:
+              path = root / 'kernel/patches' / patch['file']
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == patch['sha256']
+          print(f'PASS: one workflow, {len(uses)} immutable action references, no CI flash/deployment')
+          PY
+
+      - name: Derive immutable stage identities
+        id: identity
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib
+          root = pathlib.Path('.')
+          plan = json.loads((root / 'objects/kernel-build-plan.json').read_text())
+          rom = json.loads((root / 'objects/rom-artifacts.json').read_text())
+          vanilla = next(v for v in rom['variants'] if v['id'] == 'vanilla')
+          epoch = int(datetime.datetime.fromisoformat(plan['source']['pin_date'].replace('Z', '+00:00')).timestamp())
+          files = [
+              'kernel/configs/evox_pong_pack.config',
+              'kernel/patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch',
+              'kernel/patches/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch',
+          ]
+          kernel_identity = {
+              'schema': 'pong-kernel-inputs/1',
+              'source': plan['source']['pin'],
+              'source_pin_date': plan['source']['pin_date'],
+              'ksu': os.environ['KSU_COMMIT'],
+              'susfs_mode': 'KernelSU-Next-v3.4.2-SUSFS-LKM-2.3.0-gki',
+              'build_environment': {name: os.environ[name] for name in ('KBUILD_BUILD_USER', 'KBUILD_BUILD_HOST', 'KBUILD_BUILD_VERSION', 'LLVM', 'LLVM_IAS')},
+              'build_recipe_sha256': hashlib.sha256((root / '.github/workflows/pong-cicd.yml').read_bytes()).hexdigest(),
+              'clang_archive': os.environ['CLANG_ARCHIVE_URL'],
+              'gcc64': 'aarch64-linux-android-4.9@android-12.1.0_r27',
+              'gcc32': 'arm-linux-androideabi-4.9@android-12.1.0_r27',
+              'action': os.environ['KERNEL_ACTION_COMMIT'],
+              'defconfig': plan['build']['defconfig'],
+              'lto_mode': plan['build']['lto'],
+              'vendor_fragments': plan['build']['fragments'][:-1],
+              'config_contract': plan['configs'],
+              'file_sha256': {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in files},
+          }
+          collection_identity = {
+              'schema': 'pong-collection-inputs/1',
+              'rom_url': vanilla['url'], 'rom_sha256': vanilla['sha256'],
+              'payload_dumper': os.environ['PAYLOAD_DUMPER_COMMIT'],
+              'asset_registry': 'embedded:pong-cicd.yml:v1',
+          }
+          kf = hashlib.sha256(json.dumps(kernel_identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+          cf = hashlib.sha256(json.dumps(collection_identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+          (root / 'collection/manifests/kernel-inputs.json').write_text(json.dumps(kernel_identity, indent=2, sort_keys=True) + '\n')
+          (root / 'collection/manifests/collection-inputs.json').write_text(json.dumps(collection_identity, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'source_date_epoch={epoch}\nkernel_fingerprint={kf}\ncollection_fingerprint={cf}\n')
+          print(f'kernel_fingerprint={kf}\ncollection_fingerprint={cf}\nSOURCE_DATE_EPOCH={epoch}')
+          PY
+
+      - name: Package governance evidence for downstream jobs
+        run: |
+          set -Eeuo pipefail
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - collection/manifests logs/governance | gzip -n > governance-bundle.tar.gz
+          sha256sum governance-bundle.tar.gz > governance-bundle.tar.gz.sha256
+
+      - name: Upload governance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-governance
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            governance-bundle.tar.gz
+            governance-bundle.tar.gz.sha256
+
+  collect:
+    name: collect · verified ROM assets and explicit PENDING registry
+    needs: stack-governance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      complete: ${{ steps.registry.outputs.complete }}
+      boot_sha256: ${{ steps.rom_verify.outputs.boot_sha256 }}
+    steps:
+      - name: Checkout collection contracts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download and verify governance identities
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-governance
+          path: governance-download
+
+      - name: Unpack governance identities into the runtime collection
+        run: |
+          set -Eeuo pipefail
+          (cd governance-download && sha256sum -c governance-bundle.tar.gz.sha256)
+          tar -xzf governance-download/governance-bundle.tar.gz
+          test -f collection/manifests/kernel-inputs.json
+          test -f collection/manifests/collection-inputs.json
+
+      - name: Restore extracted ROM only for the exact ROM/tool identity
+        id: rom_extract_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: collection/rom/vanilla
+          key: pong-rom-extract-v3-${{ needs.stack-governance.outputs.collection_fingerprint }}
+
+      - name: Restore cached ROM archive on extraction miss
+        id: rom_zip_cache
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: cache/rom-vanilla
+          key: pong-rom-zip-v1-${{ hashFiles('objects/rom-artifacts.json') }}
+
+      - name: Download and verify pinned Vanilla ROM once
+        id: rom_download
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          mkdir -p cache/rom-vanilla logs/collect
+          python3 - <<'PY' > cache/rom-vanilla/download.env
+          import json, shlex
+          rom = json.load(open('objects/rom-artifacts.json'))
+          v = next(x for x in rom['variants'] if x['id'] == 'vanilla')
+          # The official device page links the same pinned filename through /download;
+          # the bare CDN path is an interstitial and is not a ROM byte stream.
+          download_url = v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url']
+          print('ROM_URL=' + shlex.quote(download_url))
+          print('ROM_SOURCE_URL=' + shlex.quote(v['url']))
+          print('ROM_SHA256=' + shlex.quote(v['sha256']))
+          print('ROM_FILENAME=' + shlex.quote(v['filename']))
+          PY
+          . cache/rom-vanilla/download.env
+          download_rom() {
+            local mode="$1" url="$2" part="cache/rom-vanilla/$ROM_FILENAME.part"
+            rm -f "$part"
+            if ! curl -fL --retry 5 --retry-delay 10 --connect-timeout 30 \
+              -w 'HTTP %{http_code}; content-type %{content_type}; bytes %{size_download}\n' \
+              -o "$part" "$url" 2>&1 | tee "logs/collect/rom-download-$mode.log"; then
+              echo "::warning::ROM $mode route failed; HTTP metrics are in pong-collection-logs"
+              return 1
+            fi
+            python3 -c 'import pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); assert zipfile.is_zipfile(p), "download is not a ZIP (possible CDN interstitial)"; z=zipfile.ZipFile(p); assert any(i.filename == "payload.bin" for i in z.infolist()), "payload.bin is absent"' "$part" || {
+              echo "::warning::ROM $mode route did not return the expected ZIP/payload.bin"
+              return 1
+            }
+            printf '%s\n' "$mode" > cache/rom-vanilla/download-mode.txt
+          }
+          ROM_OK=0
+          if download_rom direct "$ROM_URL"; then
+            ROM_OK=1
+          else
+            case "$ROM_URL" in
+              */download) PROXY_URL="${ROM_URL%/download}/proxy-download" ;;
+              *) PROXY_URL="$ROM_URL" ;;
+            esac
+            if test "$PROXY_URL" != "$ROM_URL"; then
+              echo 'Direct R2 route failed; trying the official CDN proxy fallback for the same object.'
+              if download_rom proxy "$PROXY_URL"; then ROM_OK=1; fi
+            fi
+          fi
+          if test "$ROM_OK" = 0 && test -n "${ROM_MIRROR_URL:-}"; then
+            python3 -c 'import sys,urllib.parse; u=urllib.parse.urlsplit(sys.argv[1]); assert len(sys.argv[1]) <= 4096 and u.scheme == "https" and u.hostname and not u.username and not u.password, "ROM mirror must be HTTPS without embedded credentials"' "$ROM_MIRROR_URL"
+            echo 'Official routes failed; trying the explicitly supplied mirror of the same pinned object.'
+            if download_rom mirror "$ROM_MIRROR_URL"; then ROM_OK=1; fi
+          fi
+          if test "$ROM_OK" = 0; then
+            echo '::error::All configured ROM transports failed; supply a verified HTTPS mirror or keep the collection blocked.'
+            exit 1
+          fi
+          echo "$ROM_SHA256  cache/rom-vanilla/$ROM_FILENAME.part" | sha256sum -c -
+          mv "cache/rom-vanilla/$ROM_FILENAME.part" "cache/rom-vanilla/$ROM_FILENAME"
+
+      - name: Save only the successfully verified ROM archive
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.rom_zip_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: cache/rom-vanilla
+          key: pong-rom-zip-v1-${{ hashFiles('objects/rom-artifacts.json') }}
+
+      - name: Restore payload dumper built from the exact source commit
+        id: payload_cache
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: cache/tools/payload-dumper-go
+          key: pong-payload-dumper-v1-${{ env.PAYLOAD_DUMPER_COMMIT }}-go1.25.0-linux-x64
+
+      - name: Setup pinned Go for payload extraction
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.payload_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: 1.25.0
+          cache: false
+
+      - name: Build payload dumper at the verified commit
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.payload_cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          mkdir -p cache/tools/payload-dumper-go logs/collect
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc liblzma-dev
+          git clone --filter=blob:none --no-checkout https://github.com/ssut/payload-dumper-go.git cache/tools/payload-dumper-src
+          git -C cache/tools/payload-dumper-src checkout --detach "$PAYLOAD_DUMPER_COMMIT"
+          test "$(git -C cache/tools/payload-dumper-src rev-parse HEAD)" = "$PAYLOAD_DUMPER_COMMIT"
+          (cd cache/tools/payload-dumper-src && CGO_ENABLED=1 go build -trimpath -ldflags='-s -w -buildid=' -o ../payload-dumper-go/payload-dumper-go .) 2>&1 | tee logs/collect/payload-build.log
+          cache/tools/payload-dumper-go/payload-dumper-go -h 2>&1 | tee logs/collect/payload-usage.log || test "${PIPESTATUS[0]}" = 2
+
+      - name: Cache the successfully built payload dumper
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true' && steps.payload_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: cache/tools/payload-dumper-go
+          key: pong-payload-dumper-v1-${{ env.PAYLOAD_DUMPER_COMMIT }}-go1.25.0-linux-x64
+
+      - name: Extract boot, dtbo and vbmeta from the verified payload
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: |
+          set -Eeuo pipefail
+          mkdir -p collection/rom/vanilla/extracted logs/collect
+          ROM_ZIP="$(find cache/rom-vanilla -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ROM_ZIP"
+          cache/tools/payload-dumper-go/payload-dumper-go -l "$ROM_ZIP" 2>&1 | tee collection/rom/vanilla/payload-partitions.log
+          cache/tools/payload-dumper-go/payload-dumper-go -c 4 -o collection/rom/vanilla/extracted -p boot,dtbo,vbmeta "$ROM_ZIP" 2>&1 | tee logs/collect/payload-extract.log
+          if grep -q 'init_boot' collection/rom/vanilla/payload-partitions.log; then
+            cache/tools/payload-dumper-go/payload-dumper-go -c 4 -o collection/rom/vanilla/extracted -p init_boot "$ROM_ZIP" 2>&1 | tee -a logs/collect/payload-extract.log
+          fi
+
+      - name: Verify extracted images and record ROM provenance
+        id: rom_verify
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, struct
+          root = pathlib.Path('collection/rom/vanilla')
+          out = root / 'extracted'
+          rom = json.load(open('objects/rom-artifacts.json'))
+          v = next(x for x in rom['variants'] if x['id'] == 'vanilla')
+          boot = out / 'boot.img'
+          assert boot.is_file() and boot.stat().st_size > 0, 'boot.img missing'
+          dtbo = out / 'dtbo.img'
+          assert dtbo.is_file() and dtbo.stat().st_size > 0, 'dtbo.img missing or empty'
+          with boot.open('rb') as f:
+              header = f.read(48)
+          assert header[:8] == b'ANDROID!', header[:8]
+          header_version = struct.unpack_from('<I', header, 40)[0]
+          assert 0 <= header_version <= 4, header_version
+          hashes = {}
+          for path in sorted(out.glob('*.img')):
+              hashes[path.name] = {'path': str(path), 'bytes': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+          vbmeta = out / 'vbmeta.img'
+          if vbmeta.exists():
+              assert vbmeta.read_bytes()[:4] == b'AVB0', 'invalid vbmeta magic'
+          partitions = (root / 'payload-partitions.log').read_text()
+          manifest = {
+              'schema': 'pong-rom-assets/1', 'status': 'VERIFIED',
+              'rom': {'url': v['url'], 'download_url': v['url'] + '/download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'proxy_download_url': v['url'] + '/proxy-download' if v['url'].startswith('https://cdn.evolution-x.org/') else v['url'], 'download_mode': pathlib.Path('cache/rom-vanilla/download-mode.txt').read_text().strip() if pathlib.Path('cache/rom-vanilla/download-mode.txt').is_file() else 'restored-extraction-cache', 'filename': v['filename'], 'sha256': v['sha256']},
+              'payload_dumper_commit': os.environ['PAYLOAD_DUMPER_COMMIT'],
+              'boot_header_version': header_version,
+              'init_boot_present': 'init_boot' in partitions,
+              'images': hashes,
+              'rollback_artifact': str(boot),
+              'rollback_source': 'byte stream extracted from the SHA256-verified Vanilla ROM payload',
+              'device_backup_tested': False,
+          }
+          (root / 'rom.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh:
+              gh.write('boot_sha256=' + hashes['boot.img']['sha256'] + '\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Cache only successfully verified extracted ROM assets
+        if: steps.rom_extract_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: collection/rom/vanilla
+          key: pong-rom-extract-v3-${{ needs.stack-governance.outputs.collection_fingerprint }}
+
+      - name: Restore the pinned public component collection
+        id: components_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            collection/modules
+            collection/apps
+          key: pong-public-components-v1-${{ hashFiles('.github/workflows/pong-cicd.yml') }}
+
+      - name: Create runtime collection registry with real paths and PENDING states
+        id: registry
+        run: |
+          set -Eeuo pipefail
+          mkdir -p collection/manifests logs/collect
+          cat > collection/manifests/asset-registry.json <<'JSON'
+          {
+            "schema": "pong-asset-registry/1",
+            "note": "Runtime collection object. PENDING is explicit and can never satisfy staging.",
+            "assets": [
+              {"id":"ksu-next-manager","required":true,"kind":"apps/ksu-next","status":"pinned","url":"https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.4.2/KernelSU_Next_v3.4.2_33355-release.apk","filename":"KernelSU_Next_v3.4.2_33355-release.apk","sha256":"774a5511f7034a4930e881114e202319cbdc34c5aaaa5c7c6b6d2902364e4c58","pin":"v3.4.2"},
+              {"id":"susfs-userspace-r28","required":true,"kind":"modules/susfs-userspace","status":"pinned","url":"https://github.com/sidex15/susfs4ksu-module/releases/download/v1.5.2%2B_R28/ksu_module_susfs_1.5.2%2B.zip","filename":"ksu_module_susfs_1.5.2+_R28.zip","sha256":"abcd6bf456ea8189298d9e496faa440201d90e4f0bd93b83c0527589001c9376","pin":"v1.5.2+_R28"},
+              {"id":"droidspaces-manager","required":true,"kind":"apps/droidspaces","status":"pinned","url":"https://github.com/ravindu644/Droidspaces-OSS/releases/download/v7.1.0/Droidspaces-universal-v7.1.0-4344dc5.apk","filename":"Droidspaces-universal-v7.1.0-4344dc5.apk","sha256":"36ab4466c732dc6d47136013ebab9a6c1742f38ced41a3d2acf0f7f155b930b6","pin":"v7.1.0"},
+              {"id":"droidspaces-cli","required":true,"kind":"apps/droidspaces","status":"pinned","url":"https://github.com/ravindu644/Droidspaces-OSS/releases/download/v7.1.0/droidspaces-v7.1.0-4344dc5.tar.gz","filename":"droidspaces-v7.1.0-4344dc5.tar.gz","sha256":"910d4ab3846a1c81a80414f3e391d9695f3e88c8f1ae8243dcf80e1b9425f192","pin":"v7.1.0"},
+              {"id":"firmware-pong","required":true,"kind":"firmware/pong-b4.0","status":"pending","pin":"B4.0-251119-1654","reason":"No authoritative downloadable URL and SHA256 were supplied; the device About/baseband evidence is required."},
+              {"id":"nikgapps-core","required":true,"kind":"gapps/nikgapps-core","status":"pending","pin":"arm64-16-core","reason":"No exact NikGapps release date, URL and SHA256 were supplied; never substitute latest."},
+              {"id":"zygisk-next","required":true,"kind":"modules/zygisk-next","status":"pending","pin":"v1.5.2","reason":"Exact official asset URL and SHA256 not yet curated."},
+              {"id":"pifork","required":true,"kind":"modules/pifork","status":"pending","pin":"v16","reason":"Exact official asset URL and SHA256 not yet curated."},
+              {"id":"teesimulator-rs","required":true,"kind":"modules/teesimulator-rs","status":"pending","pin":"v6.0.1-360-enhanced","reason":"Authoritative enhanced-build source and SHA256 not established."},
+              {"id":"keybox","required":true,"kind":"private/keybox","status":"pending","pin":"operator-supplied","reason":"No keybox is bundled or uploaded. Non-revoked DEVICE evidence is required; private key material is forbidden in artifacts."},
+              {"id":"vbmeta-fixer","required":true,"kind":"modules/vbmeta-fixer","status":"pending","pin":"pkg:vbmeta-fixer","reason":"No authoritative version, URL and SHA256 supplied."},
+              {"id":"circletosearch","required":true,"kind":"apps/circletosearch","status":"pending","pin":"e4f461417ed946668dbeaa11707e054d1a51cf4e","reason":"Pinned commit is known, but a reproducible APK or signed build pipeline and SHA256 are not."},
+              {"id":"morphe","required":true,"kind":"apps/morphe","status":"pending","pin":"v2.3.0","reason":"Manager alone is insufficient; patched YouTube APK provenance, patches and detach evidence are required."},
+              {"id":"gms-doze","required":true,"kind":"modules/gms-doze","status":"pending","pin":"1.9.11","reason":"Exact official asset URL and SHA256 not yet curated."},
+              {"id":"gemini","required":true,"kind":"apps/gemini","status":"pending","pin":"com.google.android.apps.bard","reason":"Play Store install and interactive login/response evidence are required on the staged device."},
+              {"id":"webview-aosp","required":true,"kind":"system/webview","status":"pending","pin":"ROM-provided","reason":"Must be proven by dumpsys webviewupdate on the staged ROM; no separate package is invented."}
+            ]
+          }
+          JSON
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request, zipfile
+          root = pathlib.Path('collection')
+          registry = json.loads((root / 'manifests/asset-registry.json').read_text())
+          results = []
+          pending_required = []
+          for asset in registry['assets']:
+              directory = root / asset['kind']
+              directory.mkdir(parents=True, exist_ok=True)
+              item = dict(asset)
+              if asset['status'] == 'pending':
+                  item['collection_path'] = str(directory / 'PENDING.json')
+                  (directory / 'PENDING.json').write_text(json.dumps(item, indent=2, sort_keys=True) + '\n')
+                  if asset['required']:
+                      pending_required.append(asset['id'])
+              else:
+                  path = directory / asset['filename']
+                  item['collection_path'] = str(path)
+                  if not path.exists():
+                      print('Downloading', asset['id'], flush=True)
+                      request = urllib.request.Request(asset['url'], headers={'User-Agent': 'pong-cicd/1'})
+                      with urllib.request.urlopen(request, timeout=120) as response, open(str(path) + '.part', 'wb') as out:
+                          while True:
+                              block = response.read(1024 * 1024)
+                              if not block:
+                                  break
+                              out.write(block)
+                      os.replace(str(path) + '.part', path)
+                  actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                  assert actual == asset['sha256'], f"{asset['id']}: expected {asset['sha256']}, got {actual}"
+                  item['status'] = 'verified'
+                  item['bytes'] = path.stat().st_size
+                  item['actual_sha256'] = actual
+                  if asset['id'] == 'susfs-userspace-r28':
+                      with zipfile.ZipFile(path) as archive:
+                          userspace = archive.read('tools/ksu_susfs_arm64')
+                          customize = archive.read('customize.sh').decode('utf-8')
+                      derived = directory / 'verified-userspace/ksu_susfs_arm64'
+                      derived.parent.mkdir(parents=True, exist_ok=True)
+                      derived.write_bytes(userspace)
+                      derived.chmod(0o755)
+                      item['userspace_binary'] = {
+                          'collection_path': str(derived),
+                          'sha256': hashlib.sha256(userspace).hexdigest(),
+                          'bytes': len(userspace),
+                      }
+                      item['installer_can_download_newer_binary'] = 'susfs4ksu-binaries/universal-binary' in customize
+                      item['installation_policy'] = 'Install offline or otherwise preserve the pinned binary; automated staging verifies the final on-device SHA256.'
+              results.append(item)
+          report = {
+              'schema': 'pong-collection-status/1',
+              'complete': not pending_required,
+              'pending_required': sorted(pending_required),
+              'assets': results,
+              'policy': 'PENDING never counts as downloaded, installed, compatible, PASS, or release-ready',
+          }
+          (root / 'manifests/collection-status.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('complete=' + str(report['complete']).lower() + '\n')
+          print('PENDING required:', ', '.join(pending_required) or 'none')
+          PY
+
+      - name: Cache the successfully verified public component set
+        if: steps.components_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            collection/modules
+            collection/apps
+          key: pong-public-components-v1-${{ hashFiles('.github/workflows/pong-cicd.yml') }}
+
+      - name: Define the required redacted manual evidence contract
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          modules = ['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12A','M12B','M13','M14','M15']
+          schema = {
+              'schema': 'pong-manual-staging/1',
+              'candidate_boot_sha256': 'exact SHA256 of the candidate boot.img tested',
+              'redacted': True,
+              'reviewer': 'human reviewer identity',
+              'reviewed_at': 'ISO-8601 timestamp',
+              'checks': {m: {'status': 'PENDING', 'evidence': [f'{m.lower()}-redacted.txt']} for m in modules},
+              'rules': [
+                  'Every M01–M15 status must be PASS for complete staging; FAIL and PENDING are not PASS.',
+                  'Evidence paths are relative regular files inside manual_evidence_dir and covered by SHA256SUMS.',
+                  'Redact accounts and personal data. Private keys, keybox.xml, tokens and credentials are forbidden.',
+                  'Automated smoke is additional evidence and never replaces any manual check.',
+              ],
+          }
+          pathlib.Path('collection/manifests/manual-evidence-schema.json').write_text(json.dumps(schema, indent=2) + '\n')
+          PY
+
+      - name: Package the runtime collection without the multi-GB ROM archive
+        run: |
+          set -Eeuo pipefail
+          tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner -cf - collection logs/collect | gzip -n > collection-bundle.tar.gz
+          sha256sum collection-bundle.tar.gz > collection-bundle.tar.gz.sha256
+
+      - name: Upload the checksummed runtime collection bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-collection
+          # Roughly 51 MiB per run; only downstream jobs in this run need this handoff.
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            collection-bundle.tar.gz
+            collection-bundle.tar.gz.sha256
+
+      - name: Publish sanitized collection failure diagnostics
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          sections = []
+          for path in sorted(pathlib.Path('logs/collect').glob('*.log')):
+              text = path.read_text(errors='replace')
+              text = re.sub(r'(https?://[^\s?]+)\?[^\s]+', r'\1?[REDACTED]', text)
+              text = text.replace('\x1b', '')
+              tail = '\n'.join(text.splitlines()[-12:])
+              if tail:
+                  sections.append(f'### {path.name}\n```text\n{tail[-6000:]}\n```')
+          report = '## Collection failed closed\n\nNo staging, release, flash, or promotion was authorized.\n\n' + ('\n\n'.join(sections) or 'No collection log was created.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(report[:50000] + '\n')
+          print('::error::Collection failed closed; see the run summary and pong-collection-logs')
+          if sections:
+              last = sections[-1].splitlines()[-2].replace('::', ': :')
+              print('::error::Last collection diagnostic: ' + last[-1500:])
+          PY
+
+      - name: Upload collection diagnostics even when download fails
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-collection-logs
+          retention-days: 14
+          if-no-files-found: warn
+          path: logs/collect
+
+  kernel-build:
+    name: kernel-build · KSU-Next + SUSFS LKM + reproducibility
+    needs: [stack-governance, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 230
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.stack-governance.outputs.source_date_epoch }}
+      KERNEL_FINGERPRINT: ${{ needs.stack-governance.outputs.kernel_fingerprint }}
+    steps:
+      - name: Checkout patches and JSON contracts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download verified collection and stock rollback boot
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-collection
+          path: collection-download
+
+      - name: Verify and unpack the collection bundle
+        run: |
+          set -Eeuo pipefail
+          (cd collection-download && sha256sum -c collection-bundle.tar.gz.sha256)
+          tar -xzf collection-download/collection-bundle.tar.gz
+          test -f collection/manifests/collection-status.json
+          test -f collection/rom/vanilla/extracted/boot.img
+
+      - name: Clone and verify the exact kernel source
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs/kernel candidate/primary
+          git clone --filter=blob:none --no-checkout https://github.com/LineageOS/android_kernel_nothing_sm8475.git kernel-source
+          git -C kernel-source checkout --detach "$KERNEL_COMMIT"
+          test "$(git -C kernel-source rev-parse HEAD)" = "$KERNEL_COMMIT"
+          test "$(git -C kernel-source show -s --format=%ct HEAD)" = "$SOURCE_DATE_EPOCH"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel-source/Makefile | tee logs/kernel/kernel-version.log
+
+      - name: Verify and apply only the two clean kABI patches
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          plan = json.load(open('objects/kernel-build-plan.json'))
+          for patch in plan['build']['patch_set'][:2]:
+              p = pathlib.Path('kernel/patches') / patch['file']
+              assert hashlib.sha256(p.read_bytes()).hexdigest() == patch['sha256']
+          PY
+          for patch in \
+            001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
+            002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch; do
+            git -C kernel-source apply --check "../kernel/patches/$patch"
+            git -C kernel-source apply "../kernel/patches/$patch"
+            printf 'PASS clean apply: %s\n' "$patch"
+          done 2>&1 | tee logs/kernel/patches.log
+          test -z "$(find kernel-source \( -name '*.rej' -o -name '*.orig' \) -print -quit)"
+
+      - name: Integrate official KernelSU-Next v3.4.2 without SUSFS kernel patch
+        run: |
+          set -Eeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/KernelSU-Next/KernelSU-Next.git kernel-source/KernelSU-Next
+          git -C kernel-source/KernelSU-Next checkout --detach "$KSU_COMMIT"
+          test "$(git -C kernel-source/KernelSU-Next rev-parse HEAD)" = "$KSU_COMMIT"
+          test "$(git -C kernel-source/KernelSU-Next describe --tags --abbrev=0)" = "$KSU_VERSION"
+          grep -q '#define SUSFS_LKM_VERSION "2.3.0-gki"' kernel-source/KernelSU-Next/kernel/susfs/susfs.h
+          ln -s ../KernelSU-Next/kernel kernel-source/drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel-source/drivers/Makefile
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel-source/drivers/Kconfig')
+          text = p.read_text()
+          needle = 'source "drivers/kernelsu/Kconfig"'
+          assert text.count(needle) == 0
+          pos = text.rfind('endmenu')
+          assert pos >= 0
+          p.write_text(text[:pos] + needle + '\n' + text[pos:])
+          PY
+          {
+            git -C kernel-source diff --check
+            git -C kernel-source diff --stat
+            git -C kernel-source diff > logs/kernel/tracked-source-changes.patch
+            git -C kernel-source status --short
+          } 2>&1 | tee logs/kernel/integration.log
+
+      - name: Generate the effective config from the JSON contract
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          plan = json.load(open('objects/kernel-build-plan.json'))
+          required = list(plan['configs']['contract'])
+          not_applicable = {}
+          for item in plan['configs']['module_specific']:
+              name = item['config']
+              if name == 'CONFIG_KPM':
+                  not_applicable[name] = 'Not a KernelSU-Next v3.4.2 Kconfig requirement; no symbol is fabricated.'
+              elif name == 'CONFIG_SUSFS':
+                  not_applicable[name] = 'Replaced by the separately built and runtime-tested SUSFS 2.3.0-gki LKM.'
+              else:
+                  required.append(name)
+          lto_mode = plan['build']['lto']
+          lto_configs = {'full': 'CONFIG_LTO_CLANG_FULL', 'thin': 'CONFIG_LTO_CLANG_THIN'}
+          assert lto_mode in lto_configs, f'Unsupported reviewed LTO mode: {lto_mode}'
+          required += ['CONFIG_MODULES', 'CONFIG_MODULE_UNLOAD', 'CONFIG_KPROBES', 'CONFIG_CFI_CLANG', 'CONFIG_DRM_MSM', lto_configs[lto_mode]]
+          required = sorted(set(required))
+          target = pathlib.Path('kernel-source/arch/arm64/configs/evox_pong_pack_ci.config')
+          target.write_text('# Generated from objects/kernel-build-plan.json; see kernel-config-expectations.json\n' + ''.join(f'{name}=y\n' for name in required))
+          requested = pathlib.Path('kernel/configs/evox_pong_pack.config').read_bytes()
+          pathlib.Path('kernel-source/arch/arm64/configs/evox_pong_pack_requested.config').write_bytes(requested)
+          unique_defconfig = pathlib.Path('kernel-source/arch/arm64/configs') / f'pong_{__import__("os").environ["KERNEL_FINGERPRINT"]}_defconfig'
+          unique_defconfig.write_bytes(pathlib.Path('kernel-source/arch/arm64/configs/gki_defconfig').read_bytes())
+          report = {'schema': 'pong-kernel-config-contract/1', 'required_y': required, 'not_applicable': not_applicable,
+                    'lto_mode': lto_mode, 'effective_fragment': str(target), 'requested_fragment_sha256': __import__('hashlib').sha256(requested).hexdigest(),
+                    'unique_defconfig': unique_defconfig.name,
+                    'cache_identity': 'The unique defconfig name is part of the marketplace action ccache key; affected-input changes cannot restore another key.'}
+          pathlib.Path('collection/manifests/kernel-config-expectations.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          print(unique_defconfig.name)
+          print(target.read_text())
+          PY
+
+      - name: Fix all remaining time-dependent build metadata
+        run: |
+          set -Eeuo pipefail
+          echo "KBUILD_BUILD_TIMESTAMP=$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+
+      - name: Prepare pinned packaging sources
+        run: |
+          set -Eeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/osm0sis/AnyKernel3.git work/AnyKernel3
+          git -C work/AnyKernel3 checkout --detach "$ANYKERNEL3_COMMIT"
+          test "$(git -C work/AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL3_COMMIT"
+          git clone --filter=blob:none --no-checkout https://github.com/Shubhamvis98/AIK.git work/AIK
+          git -C work/AIK sparse-checkout set --no-cone /bin/magiskboot_x86
+          git -C work/AIK checkout --detach "$AIK_COMMIT"
+          test "$(git -C work/AIK rev-parse HEAD)" = "$AIK_COMMIT"
+          printf '%s  %s\n' "$MAGISKBOOT_X86_SHA256" "$PWD/work/AIK/bin/magiskboot_x86" | sha256sum -c -
+          mkdir -p work/packaging
+          cp work/AIK/bin/magiskboot_x86 work/packaging/magiskboot
+          chmod 0755 work/packaging/magiskboot
+
+      - name: Preflight FullLTO resources and activate bounded swap
+        run: |
+          set -Eeuo pipefail
+          # link-vmlinux.sh performs one memory-intensive ld.lld invocation here.
+          # Preserve the canonical FullLTO/jobs=nproc contract; do not hide a
+          # resource failure by switching to ThinLTO or disabling LTO.
+          SWAP_FILE="${PONG_LTO_SWAP_FILE:-/mnt/pong-ci-lto.swap}"
+          case "$SWAP_FILE" in /*) ;; *) echo '::error::Swap path must be absolute'; exit 1 ;; esac
+          test ! -e "$SWAP_FILE"
+          nproc
+          free -h
+          df -h /mnt "$GITHUB_WORKSPACE"
+          sudo fallocate -l 8G "$SWAP_FILE"
+          test "$(stat -c %s "$SWAP_FILE")" -eq 8589934592
+          sudo chmod 600 "$SWAP_FILE"
+          sudo mkswap "$SWAP_FILE"
+          sudo swapon "$SWAP_FILE"
+          swapon --show=NAME --noheadings | awk -v file="$SWAP_FILE" '$1 == file { found=1 } END { exit(found ? 0 : 1) }'
+          free -h
+          df -h /mnt "$GITHUB_WORKSPACE"
+          swapon --show=NAME,SIZE,USED,PRIO
+
+      - name: Build kernel with the pinned Marketplace action
+        id: marketplace_build
+        timeout-minutes: 95
+        uses: dabao1955/kernel_build_action@c61fc39e72624a641caf23b71660aa4de2bff036
+        with:
+          # The pinned action recognizes local paths only when they end in '/'.
+          kernel-url: ./kernel-source/
+          config: pong_${{ needs.stack-governance.outputs.kernel_fingerprint }}_defconfig
+          arch: arm64
+          aosp-clang: false
+          other-clang-url: ${{ env.CLANG_ARCHIVE_URL }}
+          aosp-gcc: true
+          android-version: ""
+          ksu: false
+          ksu-lkm: false
+          merge-configs: '["arch/arm64/configs/vendor/waipio_GKI.config","arch/arm64/configs/vendor/nothing/waipio_GKI.config","arch/arm64/configs/vendor/debugfs.config","arch/arm64/configs/evox_pong_pack_ci.config"]'
+          disable-lto: false
+          ccache: true
+          # Its bootimg mode uses split/boot.img relative to cwd=split; stage AnyKernel3 instead.
+          anykernel3: true
+          anykernel3-url: ${{ github.workspace }}/work/AnyKernel3
+          release: false
+          extra-make-args: '[]'
+
+      - name: Repack stock boot locally with absolute paths
+        run: |
+          set -Eeuo pipefail
+          test "$(uname -m)" = x86_64
+          REPACK_DIR="$PWD/work/boot-repack"
+          MAGISKBOOT="$PWD/work/packaging/magiskboot"
+          STOCK_BOOT="$PWD/collection/rom/vanilla/extracted/boot.img"
+          KERNEL_IMAGE="$PWD/kernel-source/out/arch/arm64/boot/Image"
+          OUTPUT_BOOT="$PWD/build/boot.img"
+          test -s "$MAGISKBOOT"
+          test -s "$STOCK_BOOT"
+          test -s "$KERNEL_IMAGE"
+          printf '%s  %s\n' "$MAGISKBOOT_X86_SHA256" "$MAGISKBOOT" | sha256sum -c -
+          rm -rf "$REPACK_DIR"
+          mkdir -p "$REPACK_DIR" "$PWD/build"
+          (
+            cd "$REPACK_DIR"
+            "$MAGISKBOOT" unpack -h "$STOCK_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-unpack.log
+          rm -f "$REPACK_DIR/kernel"
+          cp "$KERNEL_IMAGE" "$REPACK_DIR/kernel"
+          (
+            cd "$REPACK_DIR"
+            "$MAGISKBOOT" repack "$STOCK_BOOT" "$OUTPUT_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-repack.log
+          test -s "$OUTPUT_BOOT"
+          VERIFY_DIR="$PWD/work/boot-verify"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          (
+            cd "$VERIFY_DIR"
+            "$MAGISKBOOT" unpack "$OUTPUT_BOOT"
+          ) 2>&1 | tee logs/kernel/boot-verify-unpack.log
+          cmp "$VERIFY_DIR/kernel" "$KERNEL_IMAGE"
+          STOCK_BOOT="$STOCK_BOOT" OUTPUT_BOOT="$OUTPUT_BOOT" python3 - <<'PY'
+          import hashlib, json, os, pathlib, struct
+          stock = pathlib.Path(os.environ['STOCK_BOOT'])
+          output = pathlib.Path(os.environ['OUTPUT_BOOT'])
+          def header_version(path):
+              with path.open('rb') as handle:
+                  header = handle.read(48)
+              assert len(header) == 48 and header[:8] == b'ANDROID!', f'invalid Android boot header: {path}'
+              version = struct.unpack_from('<I', header, 40)[0]
+              assert 0 <= version <= 4, (path, version)
+              return version
+          stock_version = header_version(stock)
+          output_version = header_version(output)
+          assert output_version == stock_version, (stock_version, output_version)
+          stock_bytes = stock.stat().st_size
+          output_bytes = output.stat().st_size
+          assert output_bytes * 100 <= stock_bytes * 105, f'boot.img exceeds stock + 5%: {stock_bytes} -> {output_bytes}'
+          report = {
+              'schema': 'pong-boot-repack/1', 'status': 'PASS',
+              'stock': {'bytes': stock_bytes, 'sha256': hashlib.sha256(stock.read_bytes()).hexdigest(), 'header_version': stock_version},
+              'output': {'bytes': output_bytes, 'sha256': hashlib.sha256(output.read_bytes()).hexdigest(), 'header_version': output_version},
+              'kernel_roundtrip_byte_identical': True,
+              'size_within_stock_plus_5_percent': True,
+              'device_boot_proven': False,
+          }
+          rendered = json.dumps(report, indent=2, sort_keys=True) + '\n'
+          pathlib.Path('candidate/primary/boot-repack.json').write_text(rendered)
+          pathlib.Path('logs/kernel/boot-repack-validation.json').write_text(rendered)
+          print(rendered)
+          PY
+          sha256sum "$STOCK_BOOT" "$KERNEL_IMAGE" "$OUTPUT_BOOT" | tee logs/kernel/boot-repack-hashes.log
+
+      - name: Preserve ccache even when a long build fails
+        if: ${{ always() && steps.marketplace_build.outcome == 'failure' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.ccache
+          # Same strict identity used by the pinned action; it restores only this fingerprint family.
+          key: ccache-pong_${{ needs.stack-governance.outputs.kernel_fingerprint }}_defconfig-${{ github.sha }}
+
+      - name: Preserve first-build outputs and verify toolchain/config
+        run: |
+          set -Eeuo pipefail
+          test -f build/boot.img
+          test -f kernel-source/out/arch/arm64/boot/Image
+          test -f kernel-source/out/.config
+          "$HOME/clang/bin/clang" --version 2>&1 | tee logs/kernel/clang-version.log
+          grep -q 'r530567' logs/kernel/clang-version.log
+          cp build/boot.img candidate/primary/boot.img
+          cp kernel-source/out/arch/arm64/boot/Image candidate/primary/Image
+          cp kernel-source/out/.config candidate/primary/evox_pong_pack.config
+          cp kernel-source/out/build.log logs/kernel/build-first.log
+          for file in Module.symvers System.map include/config/kernel.release include/generated/utsrelease.h; do
+            test -s "kernel-source/out/$file"
+            cp "kernel-source/out/$file" "candidate/primary/$(basename "$file")"
+          done
+          find kernel-source/out/arch/arm64/boot -maxdepth 1 -type f \( -name 'dtbo.img' -o -name '*.dtb' \) -exec cp {} candidate/primary/ \;
+          python3 - <<'PY'
+          import json, pathlib
+          expected = json.load(open('collection/manifests/kernel-config-expectations.json'))
+          config = pathlib.Path('kernel-source/out/.config').read_text().splitlines()
+          values = {line.split('=', 1)[0]: line.split('=', 1)[1] for line in config if line.startswith('CONFIG_') and '=' in line}
+          missing = {name: values.get(name, 'ABSENT') for name in expected['required_y'] if values.get(name) != 'y'}
+          report = {'required_y': expected['required_y'], 'not_applicable': expected['not_applicable'], 'missing_or_not_y': missing,
+                    'status': 'PASS' if not missing else 'FAIL', 'config_sha256': __import__('hashlib').sha256(pathlib.Path('kernel-source/out/.config').read_bytes()).hexdigest()}
+          pathlib.Path('candidate/primary/kernel-config.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          assert not missing, missing
+          for name in expected['not_applicable']:
+              assert name not in values or values[name] != 'y', f'{name} unexpectedly present; review the integration mode'
+          print('PASS compiled config contract:', len(expected['required_y']), 'options =y')
+          PY
+
+      - name: Build SUSFS 2.3.0-gki LKM against the exact kernel output
+        timeout-minutes: 35
+        run: |
+          set -Eeuo pipefail
+          export PATH="/usr/lib/ccache:$HOME/clang/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          make -C kernel-source O="$PWD/kernel-source/out" M="$PWD/kernel-source/KernelSU-Next/kernel/susfs" \
+            ARCH=arm64 CC=clang CROSS_COMPILE="$HOME/gcc-64/bin/aarch64-linux-android-4.9-" \
+            CROSS_COMPILE_ARM32="$HOME/gcc-32/bin/arm-linux-androideabi-4.9-" \
+            CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules 2>&1 | tee logs/kernel/susfs-lkm-build.log
+          MODULE=kernel-source/KernelSU-Next/kernel/susfs/susfs_guard_lkm.ko
+          test -s "$MODULE"
+          mkdir -p candidate/susfs-lkm-loader candidate/standalone
+          cp "$MODULE" candidate/standalone/android13-5.10_susfs_guard_lkm.ko
+          "$HOME/clang/bin/llvm-strip" -d candidate/standalone/android13-5.10_susfs_guard_lkm.ko
+          cp candidate/standalone/android13-5.10_susfs_guard_lkm.ko candidate/susfs-lkm-loader/susfs_guard_lkm.ko
+          KERNEL_RELEASE="$(cat kernel-source/out/include/config/kernel.release)"
+          VERMAGIC="$(modinfo -F vermagic candidate/standalone/android13-5.10_susfs_guard_lkm.ko)"
+          case "$VERMAGIC" in "$KERNEL_RELEASE "*) ;; *) echo "vermagic mismatch: $VERMAGIC != $KERNEL_RELEASE"; exit 1;; esac
+          modinfo candidate/standalone/android13-5.10_susfs_guard_lkm.ko | tee candidate/standalone/susfs_guard_lkm.modinfo.txt
+          modinfo candidate/standalone/android13-5.10_susfs_guard_lkm.ko | grep -q '2.3.0-gki'
+
+      - name: Package the fail-closed pre-module SUSFS loader
+        run: |
+          set -Eeuo pipefail
+          cat > candidate/susfs-lkm-loader/module.prop <<'EOF'
+          id=susfs_lkm_loader
+          name=SUSFS 2.3.0-gki LKM loader for KernelSU-Next v3.4.2
+          version=v2.3.0-gki
+          versionCode=20300
+          author=KernelSU-Next / Pong CI
+          description=Loads the matching SUSFS LKM through /data/adb/ksud before all post-fs-data modules. No plain insmod.
+          EOF
+          cat > candidate/susfs-lkm-loader/customize.sh <<'EOF'
+          #!/system/bin/sh
+          [ -x /data/adb/ksud ] || abort "KernelSU-Next ksud is required"
+          mkdir -p /data/adb/post-fs-data.d
+          cat > /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh <<'LOADER'
+          #!/system/bin/sh
+          MODULE_DIR=/data/adb/modules/susfs_lkm_loader
+          [ ! -f "$MODULE_DIR/disable" ] || exit 0
+          [ ! -f "$MODULE_DIR/remove" ] || exit 0
+          [ -f "$MODULE_DIR/susfs_guard_lkm.ko" ] || exit 1
+          if ! /data/adb/ksud susfs version >/dev/null 2>&1; then
+            if /data/adb/ksud insmod "$MODULE_DIR/susfs_guard_lkm.ko" >/dev/null 2>&1; then
+              rm -f /data/adb/ksu/susfs-lkm-loader.failed
+            else
+              echo "SUSFS LKM load failed; see ksud/dmesg" > /data/adb/ksu/susfs-lkm-loader.failed
+              exit 1
+            fi
+          fi
+          LOADER
+          chmod 0755 /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh
+          set_perm "$MODPATH/susfs_guard_lkm.ko" 0 0 0644
+          set_perm "$MODPATH/uninstall.sh" 0 0 0755
+          ui_print "SUSFS LKM will load before post-fs-data modules on next boot"
+          EOF
+          cat > candidate/susfs-lkm-loader/uninstall.sh <<'EOF'
+          #!/system/bin/sh
+          rm -f /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh
+          EOF
+          chmod 0755 candidate/susfs-lkm-loader/customize.sh candidate/susfs-lkm-loader/uninstall.sh
+          python3 - <<'PY'
+          import datetime, os, pathlib, zipfile
+          root = pathlib.Path('candidate/susfs-lkm-loader')
+          epoch = int(os.environ['SOURCE_DATE_EPOCH'])
+          timestamp = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+          date_time = (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute, timestamp.second)
+          output = pathlib.Path('candidate/SUSFS-LKM-loader-android13-5.10.zip')
+          with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for path in sorted(root.rglob('*')):
+                  if not path.is_file():
+                      continue
+                  info = zipfile.ZipInfo(path.relative_to(root).as_posix(), date_time)
+                  info.external_attr = (0o100755 if path.suffix == '.sh' else 0o100644) << 16
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  z.writestr(info, path.read_bytes())
+          print(output)
+          PY
+
+      - name: Compile a static ARM64 namespace/IPC/BPF self-test
+        run: |
+          set -Eeuo pipefail
+          mkdir -p candidate/tests work/selftest
+          cat > work/selftest/pong-selftest.c <<'EOF'
+          #include <linux/bpf.h>
+          #include <linux/sched.h>
+          #include <asm/unistd.h>
+          #include <stddef.h>
+          #include <stdint.h>
+
+          #define IPC_PRIVATE 0
+          #define IPC_CREAT 01000
+          #define IPC_RMID 0
+          #define O_CREAT 0100
+          #define O_EXCL 0200
+          #define O_RDWR 02
+          #define SIGCHLD 17
+
+          static long syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+              register long x0 __asm__("x0") = a0;
+              register long x1 __asm__("x1") = a1;
+              register long x2 __asm__("x2") = a2;
+              register long x3 __asm__("x3") = a3;
+              register long x4 __asm__("x4") = a4;
+              register long x5 __asm__("x5") = a5;
+              register long x8 __asm__("x8") = n;
+              __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8) : "memory", "cc");
+              return x0;
+          }
+          static long call0(long n) { return syscall6(n, 0, 0, 0, 0, 0, 0); }
+          static long call1(long n, long a0) { return syscall6(n, a0, 0, 0, 0, 0, 0); }
+          static long call2(long n, long a0, long a1) { return syscall6(n, a0, a1, 0, 0, 0, 0); }
+          static long call3(long n, long a0, long a1, long a2) { return syscall6(n, a0, a1, a2, 0, 0, 0); }
+          static long call4(long n, long a0, long a1, long a2, long a3) { return syscall6(n, a0, a1, a2, a3, 0, 0); }
+          static void say(const char *s, unsigned long n) { (void)call3(__NR_write, 1, (long)s, n); }
+          static void sayz(const char *s) { unsigned long n = 0; while (s[n]) n++; say(s, n); }
+          #define SAY(s) say(s, sizeof(s) - 1)
+          static int fail(const char *s, unsigned long n, int code) { say(s, n); return code; }
+          #define FAIL(s, code) fail(s, sizeof(s) - 1, code)
+
+          static int ipc_tests(void) {
+              long shm = call3(__NR_shmget, IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+              if (shm < 0) return FAIL("FAIL shmget\n", 11);
+              if (call3(__NR_shmctl, shm, IPC_RMID, 0) < 0) return FAIL("FAIL shmctl cleanup\n", 12);
+              long msg = call2(__NR_msgget, IPC_PRIVATE, IPC_CREAT | 0600);
+              if (msg < 0) return FAIL("FAIL msgget\n", 13);
+              if (call3(__NR_msgctl, msg, IPC_RMID, 0) < 0) return FAIL("FAIL msgctl cleanup\n", 14);
+              /* Raw mq syscalls use a slash-free name; libc normally strips the POSIX leading slash. */
+              static const char queue[] = "pongci";
+              long mq = call4(__NR_mq_open, (long)queue, O_CREAT | O_EXCL | O_RDWR, 0600, 0);
+              if (mq < 0) return FAIL("FAIL mq_open\n", 15);
+              if (call1(__NR_mq_unlink, (long)queue) < 0) return FAIL("FAIL mq_unlink\n", 16);
+              SAY("PASS sysv-shm sysv-msg posix-mqueue\n");
+              return 0;
+          }
+
+          static int bpf_test(void) {
+              static const char license[] = "GPL";
+              static char logbuf[4096];
+              struct bpf_insn insns[2];
+              union bpf_attr attr;
+              unsigned long i;
+              unsigned char *p = (unsigned char *)&attr;
+              for (i = 0; i < sizeof(attr); i++) p[i] = 0;
+              insns[0].code = 0xb7; insns[0].dst_reg = 0; insns[0].src_reg = 0; insns[0].off = 0; insns[0].imm = 0;
+              insns[1].code = 0x95; insns[1].dst_reg = 0; insns[1].src_reg = 0; insns[1].off = 0; insns[1].imm = 0;
+              attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+              attr.insn_cnt = 2;
+              attr.insns = (uint64_t)(uintptr_t)insns;
+              attr.license = (uint64_t)(uintptr_t)license;
+              attr.log_buf = (uint64_t)(uintptr_t)logbuf;
+              attr.log_size = sizeof(logbuf);
+              attr.log_level = 1;
+              long fd = call3(__NR_bpf, BPF_PROG_LOAD, (long)&attr, sizeof(attr));
+              if (fd < 0) { sayz(logbuf); return FAIL("FAIL bpf_prog_load\n", 21); }
+              (void)call1(__NR_close, fd);
+              SAY("PASS bpf-socket-filter-load\n");
+              return 0;
+          }
+
+          void _start(void) {
+              int rc = bpf_test();
+              if (rc) call1(__NR_exit, rc);
+              long flags[] = { CLONE_NEWUSER, CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID };
+              const char *names[] = { "user", "ipc", "uts", "net", "mount", "pid" };
+              for (long i = 0; i < 6; i++) {
+                  if (call1(__NR_unshare, flags[i]) < 0) {
+                      SAY("FAIL unshare namespace: "); sayz(names[i]); SAY("\n"); call1(__NR_exit, 30 + i);
+                  }
+              }
+              SAY("PASS unshare user ipc uts net mount pid\n");
+              long child = call2(__NR_clone, SIGCHLD, 0);
+              if (child < 0) { SAY("FAIL clone after pid namespace\n"); call1(__NR_exit, 40); }
+              if (child == 0) {
+                  rc = ipc_tests();
+                  call1(__NR_exit, rc);
+              }
+              int status = 0;
+              if (call4(__NR_wait4, child, (long)&status, 0, 0) < 0) { SAY("FAIL wait4\n"); call1(__NR_exit, 41); }
+              if (status != 0) { SAY("FAIL namespace child\n"); call1(__NR_exit, 42); }
+              SAY("PASS pong kernel namespace/IPC/BPF self-test\n");
+              call1(__NR_exit, 0);
+          }
+          EOF
+          "$HOME/clang/bin/clang" --target=aarch64-linux-gnu -std=c11 -Os -ffreestanding -fno-builtin \
+            -fno-stack-protector -fno-pic -nostdlib -static -fuse-ld=lld -Wl,-e,_start \
+            -I kernel-source/out/arch/arm64/include/generated/uapi \
+            -I kernel-source/arch/arm64/include/uapi -I kernel-source/include/uapi \
+            -o candidate/tests/pong-kernel-selftest work/selftest/pong-selftest.c 2>&1 | tee logs/kernel/selftest-build.log
+          test -s candidate/tests/pong-kernel-selftest
+          file candidate/tests/pong-kernel-selftest | tee candidate/tests/pong-kernel-selftest.file.txt
+          grep -q 'ELF 64-bit.*aarch64.*statically linked' candidate/tests/pong-kernel-selftest.file.txt
+
+      - name: Rebuild independently with ccache disabled and compare Image/config
+        timeout-minutes: 95
+        run: |
+          set -Eeuo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          export CCACHE_DISABLE=1
+          rm -rf kernel-source/out-repro
+          mkdir -p kernel-source/out-repro
+          cp kernel-source/out/.config kernel-source/out-repro/.config
+          MAKE_ARGS=(ARCH=arm64 CC=clang CROSS_COMPILE="$HOME/gcc-64/bin/aarch64-linux-android-4.9-" CROSS_COMPILE_ARM32="$HOME/gcc-32/bin/arm-linux-androideabi-4.9-" CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 O=out-repro)
+          make -C kernel-source "${MAKE_ARGS[@]}" olddefconfig
+          make -C kernel-source "${MAKE_ARGS[@]}" -j"$(nproc)" all 2>&1 | tee logs/kernel/build-repro.log
+          sha256sum candidate/primary/Image kernel-source/out-repro/arch/arm64/boot/Image candidate/primary/evox_pong_pack.config kernel-source/out-repro/.config | tee logs/kernel/repro-hashes.log
+          cmp candidate/primary/Image kernel-source/out-repro/arch/arm64/boot/Image
+          cmp candidate/primary/evox_pong_pack.config kernel-source/out-repro/.config
+          printf 'PASS byte-identical Image and .config with CCACHE_DISABLE=1\n' | tee logs/kernel/repro-result.log
+
+      - name: Package pinned Pong AnyKernel3, corresponding source and manifests
+        run: |
+          set -Eeuo pipefail
+          test "$(git -C work/AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL3_COMMIT"
+          rm -rf work/AnyKernel3/.git
+          cp candidate/primary/Image work/AnyKernel3/Image
+          cat > work/AnyKernel3/anykernel.sh <<'EOF'
+          ### AnyKernel3 — Nothing Phone (2) / pong, kernel-only replacement
+          properties() { '
+          kernel.string=Pong EvoX KSU-Next v3.4.2 (SUSFS LKM supplied separately)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pong
+          device.name2=Pong
+          device.name3=Nothing Phone (2)
+          supported.versions=16
+          '; }
+          # The documented manual installer is Slot-A-only; never follow the active slot.
+          BLOCK=boot_a;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=0;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          cp collection/manifests/kernel-inputs.json work/AnyKernel3/pong-kernel-inputs.json
+          python3 - <<'PY'
+          import datetime, os, pathlib, zipfile
+          root = pathlib.Path('work/AnyKernel3')
+          timestamp = datetime.datetime.fromtimestamp(int(os.environ['SOURCE_DATE_EPOCH']), datetime.timezone.utc)
+          dt = (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute, timestamp.second)
+          output = pathlib.Path('candidate/Pong-EvoX-KSU-Next-AnyKernel3.zip')
+          with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file():
+                      info = zipfile.ZipInfo(path.relative_to(root).as_posix(), dt)
+                      info.external_attr = (0o100755 if path.suffix == '.sh' else 0o100644) << 16
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      z.writestr(info, path.read_bytes())
+          PY
+          make -C kernel-source O="$PWD/kernel-source/out" M="$PWD/kernel-source/KernelSU-Next/kernel/susfs" clean >/dev/null
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            --exclude='*/.git' --exclude='kernel-source/out' --exclude='kernel-source/out-repro' \
+            -cf - kernel-source | gzip -n -9 > candidate/SOURCE.tar.gz
+          cp candidate/primary/* candidate/
+          cp collection/rom/vanilla/extracted/boot.img candidate/boot-stock-rollback.img
+          cp collection/rom/vanilla/rom.json candidate/rom-provenance.json
+          cp collection/manifests/kernel-config-expectations.json candidate/kernel-config-expectations.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('candidate')
+          manifest = json.load(open('collection/manifests/kernel-inputs.json'))
+          manifest.update({
+              'schema': 'pong-kernel-build-result/1',
+              'build_passed': True, 'reproducible_image_and_config': True,
+              'susfs_mode': 'LKM', 'susfs_lkm_version': os.environ['SUSFS_LKM_VERSION'],
+              'susfs_userspace_pin': 'v1.5.2+_R28',
+              'device_tests_executed': False, 'staging_complete': False,
+              'release_candidate_ready': False, 'production_eligible': False,
+              'production_authorized': False, 'production_deployed': False,
+              'deployment_mode': 'release-only',
+              'note': 'Build/reproducibility only. Device and M01–M15 gates decide RC readiness elsewhere.',
+          })
+          (root / 'build-result.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          files = []
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and path.name != 'SHA256SUMS' and 'primary' not in path.parts and 'susfs-lkm-loader' not in path.parts:
+                  files.append(path)
+          (root / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}\n' for p in files))
+          print('\n'.join(str(p) for p in files))
+          PY
+
+      - name: Collect failure diagnostics before Marketplace post cleanup
+        if: always()
+        env:
+          MARKETPLACE_BUILD_OUTCOME: ${{ steps.marketplace_build.outcome }}
+        run: |
+          set +e
+          mkdir -p logs/kernel
+          for path in kernel-source/out/build.log kernel-source/out/.config kernel-source/out-repro/.config; do
+            test ! -f "$path" || cp "$path" "logs/kernel/salvage-$(echo "$path" | tr '/.' '__')"
+          done
+          git -C kernel-source status --short > logs/kernel/final-source-status.log 2>&1
+          python3 - <<'PY'
+          import os, pathlib, re
+          if os.environ.get('MARKETPLACE_BUILD_OUTCOME') == 'failure':
+              workspace = pathlib.Path(os.environ.get('GITHUB_WORKSPACE', '.')).resolve()
+              def clean(line):
+                  line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line).replace('\r', ' ').strip()
+                  return line.replace(str(workspace), '.')[:900]
+              config = pathlib.Path('kernel-source/out/.config')
+              if config.is_file():
+                  for line in config.read_text(errors='replace').splitlines():
+                      if 'STACKPROTECTOR' in line or line.startswith('CONFIG_LTO_CLANG'):
+                          print(f'::warning::effective kernel config: {clean(line)}')
+              log = pathlib.Path('kernel-source/out/build.log')
+              if log.is_file():
+                  pattern = re.compile(r'ld\.lld: error|undefined symbol|referenced by|error:|failed with exit code', re.I)
+                  selected = [clean(line) for line in log.read_text(errors='replace').splitlines() if pattern.search(line)]
+                  for line in selected[-20:]:
+                      if line:
+                          print(f'::error::kernel build detail: {line}')
+          PY
+          exit 0
+
+      - name: Upload kernel logs even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-kernel-logs
+          retention-days: 14
+          if-no-files-found: warn
+          path: logs/kernel
+
+      - name: Upload the verified kernel candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-kernel-candidate
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            candidate
+            !candidate/primary
+            !candidate/susfs-lkm-loader
+
+      - name: Attest kernel artifacts by digest
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            candidate/boot.img
+            candidate/Image
+            candidate/Pong-EvoX-KSU-Next-AnyKernel3.zip
+            candidate/SUSFS-LKM-loader-android13-5.10.zip
+            candidate/standalone/android13-5.10_susfs_guard_lkm.ko
+            candidate/SOURCE.tar.gz
+
+  device-smoke:
+    name: device · automated smoke on an already staged Pong
+    needs: [collect, kernel-build]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_device_tests }}
+    runs-on: [self-hosted, pong-staging]
+    timeout-minutes: 45
+    env:
+      DEVICE_SERIAL: ${{ inputs.device_serial }}
+      MANUAL_EVIDENCE_DIR: ${{ inputs.manual_evidence_dir }}
+    outputs:
+      automated_complete: ${{ steps.automated_report.outputs.complete }}
+      manual_complete: ${{ steps.manual_report.outputs.complete }}
+    steps:
+      - name: Clear evidence from previous staging runs
+        id: evidence_cleanup
+        run: |
+          set -Eeuo pipefail
+          rm -rf -- evidence
+          mkdir -p evidence
+
+      - name: Download the exact candidate under test
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-kernel-candidate
+          path: candidate
+
+      - name: Download collection and evidence schema
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-collection
+          path: collection-download
+
+      - name: Verify and unpack the collection bundle
+        run: |
+          set -Eeuo pipefail
+          (cd collection-download && sha256sum -c collection-bundle.tar.gz.sha256)
+          tar -xzf collection-download/collection-bundle.tar.gz
+          test -f collection/manifests/manual-evidence-schema.json
+
+      - name: Verify candidate hashes before any ADB command
+        run: |
+          set -Eeuo pipefail
+          (cd candidate && sha256sum -c SHA256SUMS)
+          adb version
+          python3 - <<'PY'
+          import os, pathlib, re
+          serial = os.environ.get('DEVICE_SERIAL', '')
+          assert re.fullmatch(r'[A-Za-z0-9._:-]*', serial), 'invalid ADB serial'
+          evidence = os.environ['MANUAL_EVIDENCE_DIR']
+          assert evidence.startswith('/') and '\n' not in evidence and '\x00' not in evidence
+          print('ADB serial selection:', serial or 'exactly one connected device required')
+          print('Manual evidence directory:', evidence)
+          PY
+
+      - name: Run non-flashing automated device smoke
+        id: automated_report
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/automated logs/device
+          python3 - <<'PY'
+          import hashlib, itertools, json, os, pathlib, re, subprocess, sys, time
+          root = pathlib.Path('.')
+          out = root / 'evidence/automated'
+          serial = os.environ.get('DEVICE_SERIAL', '')
+          checks = []
+          infrastructure = []
+          adb_call_ids = itertools.count(1)
+
+          def record(name, status, detail=''):
+              checks.append({'id': name, 'status': status, 'detail': detail})
+              print(f'{status}: {name}: {detail}', flush=True)
+
+          def run(name, args, log=None, timeout=45):
+              log = log or (name + '.log')
+              try:
+                  p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                  (out / log).write_bytes(p.stdout + (b'\n--- stderr ---\n' + p.stderr if p.stderr else b''))
+                  return p.returncode, p.stdout, p.stderr.decode('utf-8', 'replace')
+              except Exception as exc:
+                  (out / log).write_text(str(exc) + '\n')
+                  return 999, b'', str(exc)
+
+          def adb(*args, timeout=45):
+              return adb_base(*args, timeout=timeout)
+
+          def adb_base(*args, timeout=45):
+              return run('adb', ['adb', '-s', serial, *args], log=f'adb-{next(adb_call_ids):04d}.log', timeout=timeout)
+
+          def adb_root(command, log, timeout=45):
+              return run(log, ['adb', '-s', serial, 'shell', 'su', '-c', command], log=log, timeout=timeout)
+
+          devices = run('adb_devices', ['adb', 'devices'])[1].decode('utf-8', 'replace')
+          online = [line.split()[0] for line in devices.splitlines()[1:] if len(line.split()) >= 2 and line.split()[1] == 'device']
+          if not serial:
+              if len(online) != 1:
+                  infrastructure.append(f'expected exactly one online ADB device, got {online}')
+                  serial = 'UNAVAILABLE'
+              else:
+                  serial = online[0]
+          elif serial not in online:
+              infrastructure.append(f'requested serial {serial} is not online: {online}')
+
+          if infrastructure:
+              for item in infrastructure:
+                  record('adb_infrastructure', 'FAIL', item)
+          else:
+              rc, stdout, stderr = adb('wait-for-device')
+              rc2, booted, _ = adb('shell', 'getprop', 'sys.boot_completed')
+              record('boot_completed', 'PASS' if rc == 0 and rc2 == 0 and booted.strip() == b'1' else 'FAIL', booted.decode().strip())
+              boot_sha = hashlib.sha256((root / 'candidate/boot.img').read_bytes()).hexdigest()
+              boot_size = (root / 'candidate/boot.img').stat().st_size
+              rc, slot_b, _ = adb('shell', 'getprop', 'ro.boot.slot_suffix')
+              slot = slot_b.decode().strip()
+              record('slot_reported', 'PASS' if slot in ('_a', '_b') else 'FAIL', slot)
+              part = ''
+              if slot in ('_a', '_b'):
+                  for base in ('/dev/block/by-name/', '/dev/block/bootdevice/by-name/'):
+                      candidate = base + 'boot' + slot
+                      rc, target, _ = adb_root(f'readlink -f {candidate}', 'boot_partition')
+                      if rc == 0 and target.strip().startswith(b'/dev/'):
+                          part = target.strip().decode()
+                          break
+              actual_boot = ''
+              if part:
+                  rc, digest, _ = adb_root(f'head -c {boot_size} {part} | sha256sum', 'active_boot_sha256', timeout=120)
+                  actual_boot = digest.decode().split()[0] if digest.decode().split() else ''
+              record('candidate_boot_active', 'PASS' if actual_boot == boot_sha else 'FAIL', f'expected={boot_sha} actual={actual_boot or "unavailable"}')
+
+              rc, uname, _ = adb('shell', 'uname', '-r')
+              expected_release = (root / 'candidate/kernel.release').read_text().strip()
+              record('kernel_release', 'PASS' if uname.strip().decode() == expected_release else 'FAIL', f'expected={expected_release} actual={uname.decode().strip()}')
+
+              rc, cfg, err = run('running_config', ['adb', '-s', serial, 'exec-out', 'su', '-c', 'cat /proc/config.gz'], log='running-config.gz', timeout=90)
+              config_hash = ''
+              if rc == 0 and cfg.startswith(b'\x1f\x8b'):
+                  import gzip
+                  try:
+                      raw = gzip.decompress(cfg)
+                      (out / 'running.config').write_bytes(raw)
+                      config_hash = hashlib.sha256(raw).hexdigest()
+                  except Exception as exc:
+                      err = str(exc)
+              expected_cfg = hashlib.sha256((root / 'candidate/evox_pong_pack.config').read_bytes()).hexdigest()
+              record('running_config_exact', 'PASS' if config_hash == expected_cfg else 'FAIL', f'expected={expected_cfg} actual={config_hash or err}')
+
+              rc, uid, _ = adb_root('id -u', 'root_uid')
+              record('root_uid', 'PASS' if rc == 0 and uid.strip() == b'0' else 'FAIL', uid.decode().strip())
+              rc, enforce, _ = adb('shell', 'getenforce')
+              record('selinux_enforcing', 'PASS' if enforce.strip() == b'Enforcing' else 'FAIL', enforce.decode().strip())
+              rc, ksu, _ = adb_root('/data/adb/ksud --version', 'ksud_version')
+              record('ksu_next_version', 'PASS' if rc == 0 and '3.4.2' in ksu.decode() else 'FAIL', ksu.decode().strip())
+              rc, manager, _ = adb('shell', 'dumpsys', 'package', 'com.rifsxd.ksunext')
+              (out / 'manager-package.txt').write_bytes(manager)
+              record('ksu_manager', 'PASS' if rc == 0 and b'versionName=3.4.2' in manager else 'FAIL', 'com.rifsxd.ksunext versionName must be 3.4.2')
+
+              rc, version, _ = adb_root('/data/adb/ksud susfs version', 'susfs_version')
+              record('susfs_version', 'PASS' if rc == 0 and version.strip() == b'v2.3.0' else 'FAIL', version.decode().strip())
+              rc, variant, _ = adb_root('/data/adb/ksud susfs variant', 'susfs_variant')
+              record('susfs_variant', 'PASS' if rc == 0 and variant.strip() == b'GKI' else 'FAIL', variant.decode().strip())
+              rc, features_b, _ = adb_root('/data/adb/ksud susfs features', 'susfs_features')
+              features = set(features_b.decode('utf-8', 'replace').split())
+              required_features = {'SUSFS_LKM_MODULES', 'CONFIG_KSU_SUSFS_SUS_PATH', 'CONFIG_KSU_SUSFS_SUS_MOUNT', 'CONFIG_KSU_SUSFS_SUS_KSTAT', 'CONFIG_KSU_SUSFS_SPOOF_UNAME', 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS'}
+              record('susfs_features', 'PASS' if rc == 0 and required_features <= features else 'FAIL', 'missing=' + ','.join(sorted(required_features - features)))
+              rc, _, _ = adb_root('test -d /sys/module/susfs_guard_lkm', 'susfs_sysfs')
+              record('susfs_lkm_loaded', 'PASS' if rc == 0 else 'FAIL', '/sys/module/susfs_guard_lkm')
+
+              collection_status = json.loads((root / 'collection/manifests/collection-status.json').read_text())
+              r28_asset = next(a for a in collection_status['assets'] if a['id'] == 'susfs-userspace-r28')
+              r28_expected = r28_asset['userspace_binary']['sha256']
+              r28_path = '/data/adb/ksu/bin/ksu_susfs'
+              rc, r28_hash_b, _ = adb_root(f'sha256sum {r28_path}', 'r28_binary_sha256')
+              r28_fields = r28_hash_b.decode().split()
+              r28_actual = r28_fields[0] if r28_fields else ''
+              rc, r28_version_b, _ = adb_root(f'{r28_path} show version', 'r28_version')
+              r28_version = r28_version_b.decode().strip()
+              record('susfs_r28_binary_exact', 'PASS' if r28_actual == r28_expected and r28_version == 'v2.3.0' else 'FAIL', f'expected_sha256={r28_expected} actual_sha256={r28_actual} version={r28_version}; online installer updates are not silently accepted')
+
+              rc, r28_variant_b, _ = adb_root(f'{r28_path} show variant', 'r28_variant')
+              r28_variant = r28_variant_b.decode().strip()
+              record('susfs_r28_variant_abi', 'PASS' if rc == 0 and r28_variant == variant.decode().strip() == 'GKI' else 'FAIL', f'ksud={variant.decode().strip()} r28={r28_variant}; GKI describes ABI, not built-in versus LKM mode')
+              rc, r28_features_b, _ = adb_root(f'{r28_path} show enabled_features', 'r28_enabled_features')
+              r28_features = set(r28_features_b.decode('utf-8', 'replace').split())
+              r28_bridge = rc == 0 and 'SUSFS_LKM_MODULES' in r28_features and required_features <= r28_features
+              record('susfs_r28_lkm_api_bridge', 'PASS' if r28_bridge else 'FAIL', 'missing=' + ','.join(sorted((required_features | {'SUSFS_LKM_MODULES'}) - r28_features)))
+              rc_disabled, _, _ = adb_root('test ! -f /data/adb/modules/susfs4ksu/disable', 'r28_module_not_disabled')
+              rc_active, _, _ = adb_root('test -f /data/adb/ksu/susfs4ksu/logs/susfs_active', 'r28_active_marker')
+              record('susfs_r28_module_active', 'PASS' if rc_disabled == 0 and rc_active == 0 else 'FAIL', f'not_disabled_rc={rc_disabled} active_marker_rc={rc_active}')
+
+              loader = '/data/adb/modules/susfs_lkm_loader/susfs_guard_lkm.ko'
+              rc, loader_b, _ = adb_root(f'sha256sum {loader}', 'loader_sha256')
+              loader_actual = loader_b.decode().split()[0] if loader_b.decode().split() else ''
+              loader_expected = hashlib.sha256((root / 'candidate/standalone/android13-5.10_susfs_guard_lkm.ko').read_bytes()).hexdigest()
+              rc_script, _, _ = adb_root('test -x /data/adb/post-fs-data.d/00-susfs_lkm_loader.sh', 'loader_script')
+              record('susfs_loader_exact', 'PASS' if loader_actual == loader_expected and rc_script == 0 else 'FAIL', f'expected={loader_expected} actual={loader_actual} pre_module_script_rc={rc_script}')
+
+              rc, uptime_b, _ = adb('shell', 'cat', '/proc/uptime')
+              try:
+                  uptime = float(uptime_b.decode().split()[0])
+              except Exception:
+                  uptime = 0.0
+              record('uptime_10_minutes', 'PASS' if uptime >= 600 else 'FAIL', f'uptime_seconds={uptime}')
+              rc, dmesg, _ = adb_root('dmesg', 'dmesg', timeout=60)
+              (out / 'dmesg.txt').write_bytes(dmesg)
+              panic = re.search(rb'Kernel panic|Unable to handle kernel|Internal error: Oops', dmesg, re.I)
+              record('no_kernel_panic', 'PASS' if rc == 0 and not panic else 'FAIL', panic.group().decode() if panic else 'no panic signature found')
+
+              pushed = run('push_selftest', ['adb', '-s', serial, 'push', 'candidate/tests/pong-kernel-selftest', '/data/local/tmp/pong-kernel-selftest'], log='push-selftest.log')
+              if pushed[0] == 0:
+                  adb('shell', 'chmod', '0755', '/data/local/tmp/pong-kernel-selftest')
+                  rc, selftest, _ = adb_root('/data/local/tmp/pong-kernel-selftest', 'kernel-selftest', timeout=90)
+                  record('namespace_ipc_bpf_syscalls', 'PASS' if rc == 0 and b'PASS pong kernel namespace/IPC/BPF self-test' in selftest else 'FAIL', selftest.decode('utf-8', 'replace').strip())
+                  adb('shell', 'rm', '-f', '/data/local/tmp/pong-kernel-selftest')
+              else:
+                  record('namespace_ipc_bpf_syscalls', 'NOT_RUN', 'selftest push failed')
+
+              # Useful evidence only; these reads never claim M02/M12A/M12B PASS.
+              adb('shell', 'cat', '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq')
+              adb('shell', 'ls', '/sys/class/thermal')
+              adb('shell', 'getprop', 'ro.build.display.id')
+              adb('shell', 'getprop', 'ro.build.version.release')
+
+          all_passed = bool(checks) and all(c['status'] == 'PASS' for c in checks) and not infrastructure
+          report = {
+              'schema': 'pong-automated-smoke/1', 'serial_hash': hashlib.sha256(serial.encode()).hexdigest() if serial else None,
+              'all_passed': all_passed, 'checks': checks,
+              'coverage_note': 'Automated smoke supplements, but never replaces, M01–M15 manual evidence. No flash, sideload, module install, slot change or reboot was performed.',
+          }
+          (root / 'evidence/automated-smoke.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh:
+              gh.write('complete=' + str(all_passed).lower() + '\n')
+          sys.exit(0 if all_passed else 1)
+          PY
+
+      - name: Validate and collect redacted M01–M15 evidence without replacing failures
+        id: manual_report
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence logs/device
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, shutil
+          source = pathlib.Path(os.environ['MANUAL_EVIDENCE_DIR'])
+          destination = pathlib.Path('evidence/manual')
+          expected_modules = {'M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12A','M12B','M13','M14','M15'}
+          errors, statuses = [], {}
+          valid = False
+          complete = False
+          automated_source = pathlib.Path('evidence/automated')
+          banned_names = re.compile(r'(^|/)(keybox\.xml|[^/]*\.(pem|key|p12|jks|keystore))$', re.I)
+          secret_pattern = re.compile(rb'BEGIN [A-Z ]*PRIVATE KEY|github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+')
+          try:
+              automated_files = [p for p in automated_source.rglob('*') if p.is_file() or p.is_symlink()]
+              assert not any(p.is_symlink() for p in automated_files), 'automated evidence symlinks are forbidden'
+              for path in automated_files:
+                  rel = path.relative_to(automated_source).as_posix()
+                  assert not banned_names.search(rel), f'forbidden secret file in automated evidence: {rel}'
+                  assert not secret_pattern.search(path.read_bytes()), f'possible secret in automated evidence: {rel}'
+          except Exception as exc:
+              shutil.rmtree(automated_source, ignore_errors=True)
+              errors.append(f'automated evidence withheld before upload: {exc}')
+          try:
+              results_path = source / 'manual-results.json'
+              data = json.loads(results_path.read_text())
+              assert data.get('schema') == 'pong-manual-staging/1'
+              assert data.get('redacted') is True, 'redacted must be explicitly true'
+              assert data.get('reviewer')
+              datetime.datetime.fromisoformat(data['reviewed_at'].replace('Z', '+00:00'))
+              boot_sha = hashlib.sha256(pathlib.Path('candidate/boot.img').read_bytes()).hexdigest()
+              assert data.get('candidate_boot_sha256') == boot_sha, 'manual evidence belongs to another boot.img'
+              checks = data.get('checks', {})
+              assert set(checks) == expected_modules, 'checks must contain exactly M01–M15'
+              for module in sorted(expected_modules):
+                  status = checks[module].get('status')
+                  statuses[module] = status
+                  if status not in ('PASS', 'FAIL', 'PENDING'):
+                      errors.append(f'{module}: invalid status {status}')
+                  if not checks[module].get('evidence'):
+                      errors.append(f'{module}: no evidence path')
+              files = [p for p in source.rglob('*') if p.is_file() or p.is_symlink()]
+              assert not any(p.is_symlink() for p in files), 'symlinks are forbidden'
+              assert len(files) <= 500, 'too many evidence files'
+              assert sum(p.stat().st_size for p in files) <= 512 * 1024 * 1024, 'evidence exceeds 512 MiB'
+              for path in files:
+                  rel = path.relative_to(source).as_posix()
+                  assert not banned_names.search(rel), f'forbidden secret file: {rel}'
+                  assert not secret_pattern.search(path.read_bytes()), f'possible secret in {rel}'
+              sums = source / 'SHA256SUMS'
+              assert sums in files, 'SHA256SUMS is required'
+              expected = {}
+              for line in sums.read_text().splitlines():
+                  digest, rel = line.split('  ', 1)
+                  assert re.fullmatch(r'[0-9a-f]{64}', digest)
+                  assert rel not in expected
+                  expected[rel] = digest
+              actual_files = {p.relative_to(source).as_posix(): p for p in files if p != sums}
+              assert set(expected) == set(actual_files), 'SHA256SUMS must cover every evidence file except itself'
+              for rel, path in actual_files.items():
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == expected[rel], f'hash mismatch: {rel}'
+              for module in sorted(expected_modules):
+                  for rel in checks[module]['evidence']:
+                      assert rel in actual_files, f'{module}: evidence missing or not hashed: {rel}'
+              valid = not errors
+              complete = valid and all(statuses[m] == 'PASS' for m in expected_modules)
+              if valid:
+                  shutil.copytree(source, destination, dirs_exist_ok=True)
+          except Exception as exc:
+              errors.append(str(exc))
+          report = {'schema': 'pong-manual-evidence-report/1', 'valid': valid, 'complete': complete,
+                    'status': 'FAIL' if any(status == 'FAIL' for status in statuses.values()) or not valid else 'PASS' if complete else 'PENDING',
+                    'checks': statuses, 'errors': errors,
+                    'policy': 'Structurally valid redacted evidence is retained even on FAIL/PENDING; invalid or unredacted evidence is not copied.'}
+          pathlib.Path('evidence/manual-report.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh:
+              gh.write('complete=' + str(complete).lower() + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload automated and validated manual evidence
+        # Never republish stale files when cleanup itself failed on a persistent runner.
+        if: ${{ always() && steps.evidence_cleanup.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-device-evidence
+          retention-days: 30
+          if-no-files-found: error
+          path: evidence
+
+      - name: Enforce smoke and manual coverage
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, sys
+          automated = json.load(open('evidence/automated-smoke.json'))
+          manual = json.load(open('evidence/manual-report.json'))
+          if not automated['all_passed']:
+              sys.exit(1)
+          if not manual['complete']:
+              if manual.get('status') == 'FAIL':
+                  print('FAIL: manual evidence is invalid or an M01–M15 check failed')
+                  sys.exit(1)
+              print('PENDING: complete M01–M15 redacted evidence is required')
+              sys.exit(3)
+          PY
+
+  staging-evaluate:
+    name: staging · calculate, never assume, complete success
+    needs: [collect, kernel-build, device-smoke]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      complete: ${{ steps.evaluate.outputs.complete }}
+    env:
+      COLLECT_RESULT: ${{ needs.collect.result }}
+      COLLECT_COMPLETE: ${{ needs.collect.outputs.complete }}
+      KERNEL_RESULT: ${{ needs.kernel-build.result }}
+      DEVICE_RESULT: ${{ needs.device-smoke.result }}
+    steps:
+      - name: Download collection result when available
+        if: needs.collect.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-collection
+          path: collection-download
+
+      - name: Verify and unpack collection when available
+        if: needs.collect.result == 'success'
+        run: |
+          set -Eeuo pipefail
+          (cd collection-download && sha256sum -c collection-bundle.tar.gz.sha256)
+          tar -xzf collection-download/collection-bundle.tar.gz
+
+      - name: Download kernel result when available
+        if: needs.kernel-build.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-kernel-candidate
+          path: candidate
+
+      - name: Download device evidence when a device job ran
+        if: needs.device-smoke.result != 'skipped'
+        continue-on-error: true
+        id: device_download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-device-evidence
+          path: evidence
+
+      - name: Compute independent build, device, collection and staging booleans
+        id: evaluate
+        run: |
+          set -Eeuo pipefail
+          mkdir -p staging
+          python3 - <<'PY'
+          import json, os, pathlib
+          def load(path, default):
+              p = pathlib.Path(path)
+              return json.loads(p.read_text()) if p.is_file() else default
+          collection = load('collection/manifests/collection-status.json', {'complete': False, 'pending_required': ['collection job did not produce a report']})
+          automated = load('evidence/automated-smoke.json', {'all_passed': False})
+          manual = load('evidence/manual-report.json', {'complete': False, 'errors': ['no device/manual evidence']})
+          build = os.environ['KERNEL_RESULT'] == 'success'
+          collected = os.environ['COLLECT_RESULT'] == 'success' and os.environ['COLLECT_COMPLETE'] == 'true' and collection.get('complete') is True
+          device = os.environ['DEVICE_RESULT'] == 'success' and automated.get('all_passed') is True
+          manual_complete = manual.get('complete') is True
+          complete = build and collected and device and manual_complete
+          pending = []
+          if not build: pending.append('kernel build/reproducibility did not succeed')
+          if not collected: pending.append('required collection inputs: ' + ', '.join(collection.get('pending_required', ['collection failed'])))
+          if not device: pending.append('automated Pong smoke was not completely PASS')
+          if not manual_complete: pending.append('M01–M15 redacted manual evidence is not completely PASS')
+          report = {
+              'schema': 'pong-staging-result/1',
+              'build_succeeded': build,
+              'collection_complete': collected,
+              'automated_device_tests_executed_and_passed': device,
+              'manual_m01_m15_complete': manual_complete,
+              'staging_complete': complete,
+              'release_candidate_ready': complete,
+              'production_eligible': complete,
+              'production_authorized': False,
+              'production_deployed': False,
+              'deployment_mode': 'release-only',
+              'pending': pending,
+              'manual_errors': manual.get('errors', []),
+              'note': 'True requires independent positive evidence in every category. Missing coverage is never success.',
+          }
+          pathlib.Path('staging/staging-result.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('complete=' + str(complete).lower() + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload staging verdict
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-staging-report
+          retention-days: 30
+          if-no-files-found: error
+          path: staging
+
+  release-candidate:
+    name: release · DRAFT RC after complete staging only
+    needs: staging-evaluate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release_candidate && needs.staging-evaluate.outputs.complete == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: write
+      attestations: read
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - name: Download candidate and complete staging verdict
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-kernel-candidate
+          path: candidate
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-staging-report
+          path: staging
+
+      - name: Verify hashes and provenance before drafting
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          test "$(python3 -c 'import json; print(json.load(open("staging/staging-result.json"))["staging_complete"])')" = True
+          (cd candidate && sha256sum -c SHA256SUMS)
+          gh attestation verify --repo "$GITHUB_REPOSITORY" candidate/boot.img
+          gh attestation verify --repo "$GITHUB_REPOSITORY" candidate/SOURCE.tar.gz
+          TAG="pong-11.11-rc${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          mkdir -p release
+          cat > release/RC-NOTES.md <<EOF
+          # Pong Evolution X 11.11 — draft release candidate
+
+          - KernelSU-Next: **v3.4.2 embedded**.
+          - SUSFS: **2.3.0-gki LKM** plus **R28 userspace**.
+          - Automated device smoke: **PASS**.
+          - Redacted M01–M15 manual evidence: **PASS**.
+          - Reproducible Image and .config: **PASS**.
+          - Deployment mode: **release-only; no CI flash and no production deployment**.
+          - Long-term 72-hour soak and production Slot A/B promotion are not claimed by this RC.
+
+          This is a DRAFT candidate, not a stable release. Verify the release-level \`SHA256SUMS\`, extract \`Pong-EvoX-KSU-Next-RC-files.tar.gz\` into an empty directory, and run \`sha256sum -c SHA256SUMS\` there before any manual staging operation. The archive preserves \`standalone/\`, \`tests/\`, and all other candidate paths.
+          EOF
+
+      - name: Package and verify a path-preserving release archive
+        run: |
+          set -Eeuo pipefail
+          ARCHIVE=Pong-EvoX-KSU-Next-RC-files.tar.gz
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf - -C candidate . | gzip -n -9 > "release/$ARCHIVE"
+          (cd release && sha256sum "$ARCHIVE" RC-NOTES.md > SHA256SUMS && sha256sum -c SHA256SUMS)
+          rm -rf -- work/release-verify
+          mkdir -p work/release-verify
+          tar -xzf "release/$ARCHIVE" -C work/release-verify
+          (cd work/release-verify && sha256sum -c SHA256SUMS)
+          diff -qr candidate work/release-verify
+
+      - name: Enforce GitHub release asset limits before drafting
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Each release asset must be strictly below 2 GiB; a release has at most 1000 assets.
+          limit = 2 * 1024**3
+          files = sorted(path for path in Path('release').rglob('*') if path.is_file())
+          oversized = [(path.as_posix(), path.stat().st_size) for path in files if path.stat().st_size >= limit]
+          assert len(files) <= 1000, f'Too many release assets: {len(files)}'
+          assert not oversized, f'Assets must use verified external storage instead of GitHub Releases: {oversized}'
+          largest = max((path.stat().st_size for path in files), default=0)
+          print(f'PASS: {len(files)} release assets; largest={largest} bytes; per-file limit={limit - 1} bytes')
+          PY
+
+      - name: Publish the draft release candidate
+        id: publish
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ steps.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Pong 11.11 RC ${{ github.run_number }} — staging verified
+          body_path: release/RC-NOTES.md
+          draft: true
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            release/*
+
+  mandate:
+    name: mandate · release-only fail-closed result
+    needs: [collect, kernel-build, staging-evaluate, release-candidate]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PUBLISH_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release_candidate }}
+      STAGING_COMPLETE: ${{ needs.staging-evaluate.outputs.complete }}
+      COLLECT_RESULT: ${{ needs.collect.result }}
+      KERNEL_RESULT: ${{ needs.kernel-build.result }}
+      RELEASE_RESULT: ${{ needs.release-candidate.result }}
+    steps:
+      - name: Download staging verdict when available
+        if: needs.staging-evaluate.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pong-staging-report
+          path: staging
+
+      - name: Enforce the selected release-only mandate
+        run: |
+          set -Eeuo pipefail
+          mkdir -p mandate
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          requested = os.environ['PUBLISH_REQUESTED'] == 'true'
+          complete = os.environ['STAGING_COMPLETE'] == 'true'
+          build = os.environ['KERNEL_RESULT'] == 'success' and os.environ['COLLECT_RESULT'] == 'success'
+          released = os.environ['RELEASE_RESULT'] == 'success'
+          ok = build and (not requested or (complete and released))
+          report = {
+              'schema': 'pong-mandate/1', 'mode': 'release-only',
+              'build_pipeline_succeeded': build,
+              'release_requested': requested,
+              'staging_complete': complete,
+              'draft_release_created': released,
+              'production_authorized': False, 'production_deployed': False,
+              'status': 'PASS' if ok else 'PENDING' if build and not complete else 'FAIL',
+              'note': 'A build-only run may pass as build-only. It never marks staging or production complete. A requested RC cannot be skipped.',
+          }
+          pathlib.Path('mandate/mandate.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(report, indent=2))
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload mandate result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-mandate
+          retention-days: 30
+          if-no-files-found: error
+          path: mandate
+
+  observer:
+    name: observer · logs, coverage and explicit pending states
+    needs: [stack-governance, collect, kernel-build, device-smoke, staging-evaluate, release-candidate, mandate]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOVERNANCE_RESULT: ${{ needs.stack-governance.result }}
+      COLLECT_RESULT: ${{ needs.collect.result }}
+      COLLECT_COMPLETE: ${{ needs.collect.outputs.complete }}
+      KERNEL_RESULT: ${{ needs.kernel-build.result }}
+      DEVICE_RESULT: ${{ needs.device-smoke.result }}
+      STAGING_RESULT: ${{ needs.staging-evaluate.result }}
+      STAGING_COMPLETE: ${{ needs.staging-evaluate.outputs.complete }}
+      RELEASE_RESULT: ${{ needs.release-candidate.result }}
+      MANDATE_RESULT: ${{ needs.mandate.result }}
+      PUBLISH_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release_candidate }}
+    steps:
+      - name: Download final reports when available
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: pong-{staging-report,mandate}
+          path: observer
+          merge-multiple: false
+
+      - name: Write the non-promoting observability record
+        run: |
+          set -Eeuo pipefail
+          mkdir -p observer
+          python3 - <<'PY'
+          import json, os, pathlib
+          results = {name: os.environ[name] for name in ('GOVERNANCE_RESULT','COLLECT_RESULT','KERNEL_RESULT','DEVICE_RESULT','STAGING_RESULT','RELEASE_RESULT','MANDATE_RESULT')}
+          staging = pathlib.Path('observer/pong-staging-report/staging-result.json')
+          mandate = pathlib.Path('observer/pong-mandate/mandate.json')
+          staging_data = json.loads(staging.read_text()) if staging.is_file() else {'staging_complete': os.environ['STAGING_COMPLETE'] == 'true', 'pending': ['staging report unavailable']}
+          mandate_data = json.loads(mandate.read_text()) if mandate.is_file() else {'status': 'PENDING', 'note': 'mandate report unavailable'}
+          report = {
+              'schema': 'pong-observer/1', 'run_id': os.environ['GITHUB_RUN_ID'], 'sha': os.environ['GITHUB_SHA'],
+              'event': os.environ['GITHUB_EVENT_NAME'], 'job_results': results,
+              'collection_complete': os.environ['COLLECT_COMPLETE'] == 'true',
+              'staging': staging_data, 'mandate': mandate_data,
+              'release_requested': os.environ['PUBLISH_REQUESTED'] == 'true',
+              'production_authorized': False, 'production_deployed': False,
+              'warning': 'Job success is scoped to that job. Build green is not device green; skipped device tests are PENDING, never PASS.',
+          }
+          pathlib.Path('observer/observability.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          lines = [
+              '# Pong pipeline observability', '',
+              f"Run: `{os.environ['GITHUB_RUN_ID']}` · event: `{os.environ['GITHUB_EVENT_NAME']}`", '',
+              '| Stage | Result |', '|---|---|',
+          ]
+          for name, value in results.items():
+              lines.append(f"| {name.replace('_RESULT','').lower()} | **{value or 'unknown'}** |")
+          lines += ['', f"- Collection complete: **{report['collection_complete']}**",
+                    f"- Staging complete: **{staging_data.get('staging_complete', False)}**",
+                    f"- Release requested: **{report['release_requested']}**",
+                    '- Production authorized/deployed: **false / false**', '',
+                    '### Pending / blockers']
+          pending = staging_data.get('pending', [])
+          lines += [f'- {item}' for item in pending] or ['- None recorded.']
+          lines += ['', '**Scope:** build success, executed tests, and complete staging are independent booleans. No flash or production deployment occurred.']
+          pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('\n'.join(lines) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload observer record
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pong-observer
+          retention-days: 30
+          if-no-files-found: error
+          path: observer
