@@ -735,6 +735,28 @@ jobs:
           cp work/AIK/bin/magiskboot_x86 work/packaging/magiskboot
           chmod 0755 work/packaging/magiskboot
 
+      - name: Preflight FullLTO resources and activate bounded swap
+        run: |
+          set -Eeuo pipefail
+          # link-vmlinux.sh performs one memory-intensive ld.lld invocation here.
+          # Preserve the canonical FullLTO/jobs=nproc contract; do not hide a
+          # resource failure by switching to ThinLTO or disabling LTO.
+          SWAP_FILE="${PONG_LTO_SWAP_FILE:-/mnt/pong-ci-lto.swap}"
+          case "$SWAP_FILE" in /*) ;; *) echo '::error::Swap path must be absolute'; exit 1 ;; esac
+          test ! -e "$SWAP_FILE"
+          nproc
+          free -h
+          df -h /mnt "$GITHUB_WORKSPACE"
+          sudo fallocate -l 8G "$SWAP_FILE"
+          test "$(stat -c %s "$SWAP_FILE")" -eq 8589934592
+          sudo chmod 600 "$SWAP_FILE"
+          sudo mkswap "$SWAP_FILE"
+          sudo swapon "$SWAP_FILE"
+          swapon --show=NAME --noheadings | awk -v file="$SWAP_FILE" '$1 == file { found=1 } END { exit(found ? 0 : 1) }'
+          free -h
+          df -h /mnt "$GITHUB_WORKSPACE"
+          swapon --show=NAME,SIZE,USED,PRIO
+
       - name: Build kernel with the pinned Marketplace action
         id: marketplace_build
         timeout-minutes: 95
