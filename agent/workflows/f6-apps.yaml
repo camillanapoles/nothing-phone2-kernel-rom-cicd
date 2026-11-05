@@ -1,0 +1,101 @@
+# F6–F7 — apps e performance. A tentação aqui é declarar sucesso por um app; o critério é por app.
+name: "F6–F7 · Apps e performance"
+description: "Instalação e verificação por app (Gemini, Drive, CircleToSearch, Morphe) e regressão de bateria com FCM intacto."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F6
+  phases: [F6, F7]
+  owner: device-qa
+  deterministic_gate:
+    kind: device
+    command: "bash scripts/rollout_gate.sh F6 && bash scripts/rollout_gate.sh F7"
+    expect: "exit 0; 7 critérios do CircleToSearch e FCM ok"
+  source_of_truth: [INSTALL-SEQUENCE.md, objects/install-stack.json]
+  failure_policy: stop-on-fail
+  safety:
+    slot: a
+    one_module_per_reboot: true
+    manual_execution_only: true
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: os 7 critérios do CircleToSearch)"
+    required: true
+  - name: keep_drive
+    description: "manter Drive (backup) ou não"
+    default: "sim"
+
+steps:
+  - id: apps_install
+    role: device-qa
+    skill: [phase-gate, falsifiable-evidence]
+    task: |
+      Objetivo: {{goal}}. Drive: {{keep_drive}}.
+
+      F6.1–6.4 — Gemini (login+resposta), Drive (se mantido, sync de um arquivo),
+      CircleToSearch @ e4f4614, Morphe v2.3.0 + YouTube patcheado + detach.
+      Um app por vez, PASS antes do próximo. Nenhum app é "instalado e dado como funcionando".
+    output: apps_ledger
+    artifacts: [agent/artifacts/f6/apps.md]
+    pass_criteria:
+      - "cada app tem prova de funcionamento (não apenas instalação)"
+      - "versão instalada == pin da camada no stack"
+      - "detach do YouTube comprovado (update do Play não sobrescreve)"
+
+  - id: circletosearch_criteria
+    role: device-qa
+    skill: [falsifiable-evidence]
+    depends_on: [apps_install]
+    task: |
+      Os 7 critérios do CircleToSearch, um a um, com saída/observação e timestamp:
+      sem GMS · pílula responde ao long-press · não engole o swipe-up · role de assistente sem app
+      Google · cópia de texto com rede desligada · tradução presente no commit pinado · sem
+      notificação persistente.
+
+      Base: {{apps_ledger}}
+    output: cts_matrix
+    artifacts: [agent/artifacts/f6/circletosearch.md]
+    pass_criteria:
+      - "7 linhas, cada uma PASS/FAIL/PENDENTE com evidência"
+      - "tradução ausente no commit = PENDENTE (não FAIL inventado, não PASS)"
+
+  - id: battery_regression
+    role: device-qa
+    skill: [falsifiable-evidence]
+    depends_on: [circletosearch_criteria]
+    task: |
+      F7 — Universal GMS Doze 1.9.11; GMS otimizável com FCM intacto; restringir background de
+      Drive/Gemini; Find My Device off; baseline de idle noturno medido (não estimado) + OTP chegando.
+
+      CTS: {{cts_matrix}}
+    output: battery_ledger
+    pass_criteria:
+      - "drain medido com janela declarada (hora início/fim)"
+      - "FCM comprovado por OTP real, não por 'parece ok'"
+      - "alvo de drain declarado antes da medição"
+
+  - id: apps_limits
+    role: privacy-analyst
+    skill: [falsifiable-evidence]
+    depends_on: [battery_regression]
+    task: |
+      Declare o que não foi testado e o que pode mudar com update de app. Base: {{battery_ledger}}
+    output: apps_limits
+    pass_criteria:
+      - "lista explícita de apps não testados"
+      - "nenhuma garantia sobre versão futura de app"
+    handoff:
+      declares:
+        gemini: "pass|fail|pending"
+        drive: "pass|fail|not-installed"
+        circletosearch: "pass|fail|pending"
+        morphe: "pass|fail|pending"
+        fcm: "intact|broken"
+        idle_drain: "valor medido"
+      evidence:
+        - "agent/artifacts/f6/circletosearch.md"
+        - "adb shell dumpsys deviceidle whitelist"

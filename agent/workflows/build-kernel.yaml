@@ -1,0 +1,101 @@
+# F0.6 / build — o kernel é o artefato que mais custa e o que mais mente quando o build é verde.
+# Aqui o agente planeja e audita; quem compila é o CI. Build verde nunca vira "device ok".
+name: "Build · kernel sm8475 (KSU-Next + SUSFS)"
+description: "Planeja e audita o build do kernel: ordem de patch, contrato de config, toolchain e reprodutibilidade."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F0
+  owner: kernel-architect
+  deterministic_gate:
+    kind: command
+    command: "python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json"
+    expect: "exit 0"
+  ci_job: kernel-build
+  source_of_truth: [objects/kernel-build-plan.json, kernel/patches/SHA256SUMS, kernel/configs/evox_pong_pack.config]
+  failure_policy: fail-build
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: build reprodutível do commit pinado)"
+    required: true
+
+steps:
+  - id: patch_order
+    role: kernel-architect
+    skill: [build-contract, pin-discipline]
+    task: |
+      Objetivo: {{goal}}
+
+      Valide a ordem do patchset no plano:
+      001 kABI sysvipc → 002 mqueue padding → KernelSU-Next v3.4.2 → SUSFS 2.3.0-gki LKM.
+      Para cada patch: arquivo, sha256 declarado vs. `sha256sum` real, e o que acontece na rejeição
+      (`on_reject`). Inverter a ordem é FAIL estrutural, mesmo que o build passe.
+    output: patch_plan
+    artifacts: [agent/artifacts/build/patch-order.md]
+    pass_criteria:
+      - "cada patch tem sha256 declarado == sha256 real"
+      - "ordem declarada é kABI → KSU → SUSFS"
+      - "nenhum patch marcado para aplicar com --fuzz/--force"
+    deterministic_gate:
+      kind: command
+      command: "(cd kernel/patches && sha256sum -c SHA256SUMS)"
+      expect: "exit 0"
+
+  - id: config_contract
+    role: kernel-architect
+    skill: [build-contract]
+    depends_on: [patch_order]
+    task: |
+      Confira o contrato de config: `gki_defconfig` + fragmentos vendor (waipio, waipio nothing,
+      debugfs) + `evox_pong_pack.config`, nesta ordem, com `LLVM=1 LLVM_IAS=1` e clang-r530567.
+
+      Aponte qualquer config do fragmento que quebre compatibilidade GKI. Plano: {{patch_plan}}
+    output: config_report
+    pass_criteria:
+      - "ordem de merge dos fragmentos explícita"
+      - "toolchain e flags citados com o valor do objeto, não de memória"
+      - "config fora de GKI listada individualmente com impacto"
+
+  - id: reproducibility_audit
+    role: evidence-auditor
+    skill: [falsifiable-evidence, artifact-integrity]
+    depends_on: [config_contract]
+    task: |
+      Estabeleça o que prova reprodutibilidade e o que só parece provar:
+      `SOURCE_DATE_EPOCH`, `KBUILD_BUILD_USER/HOST/VERSION`, hash do manifesto de inputs do run,
+      `.config` final publicado, `SOURCE.tar.gz` presente (GPL).
+
+      Config: {{config_report}}
+    output: repro_ledger
+    artifacts: [agent/artifacts/build/reproducibility.md]
+    pass_criteria:
+      - "todo item tem fonte (arquivo:campo ou saída de comando)"
+      - "o que não for demonstrável está listado como PENDENTE"
+
+  - id: build_verdict
+    role: pipeline-engineer
+    skill: [pipeline-fail-closed]
+    depends_on: [reproducibility_audit]
+    task: |
+      Feche o veredito do build lendo o job `kernel-build` do run atual:
+      resultado, artefatos, hashes, attestation. Build verde com artefato faltando é FAIL, não PASS.
+
+      Ledger: {{repro_ledger}}
+    output: build_verdict
+    artifacts: [agent/artifacts/build/verdict.md]
+    pass_criteria:
+      - "veredito cita job, run id e sha do commit"
+      - "todo artefato publicado tem sha256"
+      - "ausência de SOURCE.tar.gz = FAIL (GPL)"
+    handoff:
+      declares:
+        build_status: "pass|fail|pending"
+        artifacts_sha256: "mapa arquivo→hash"
+        not_proven: "lista (soak 72h, promoção de slot, …)"
+      evidence:
+        - "gh run view <run-id> --json jobs,conclusion,artifacts"
+        - "sha256sum candidate/Image candidate/boot.img candidate/dtbo.img"

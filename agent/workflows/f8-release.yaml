@@ -1,0 +1,113 @@
+# F8 — fechamento por tópico e draft RC. O único lugar que decide publicar algo.
+name: "F8 · Fechamento e draft RC"
+description: "Consolida evidência das fases, fecha tópicos, separa provado/pendente/fora de escopo e só então cria draft RC."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F8
+  owner: release-steward
+  deterministic_gate:
+    kind: ci
+    command: "make -s prove"
+    expect: "exit 0; mandate com production_authorized=false"
+  ci_job: mandate
+  source_of_truth: [objects/install-stack.json, objects/rom-artifacts.json, .github/workflows/pong-cicd.yml]
+  failure_policy: fail-closed
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: F8 fechado com 6 tópicos)"
+    required: true
+  - name: run_id
+    description: "id do run do GitHub Actions que contém o build e a evidência"
+    required: true
+
+steps:
+  - id: collect_evidence
+    role: evidence-auditor
+    skill: [falsifiable-evidence, artifact-integrity]
+    task: |
+      Objetivo: {{goal}}. Run: {{run_id}}.
+
+      Monte o ledger final: build (artefatos+sha256+attestation), staging (M01–M15), fases F4–F7
+      (herdadas dos handoffs), gates (stack, kernel-build, agent). Item sem fonte = PENDENTE.
+    output: final_ledger
+    artifacts: [agent/artifacts/f8/ledger.md]
+    pass_criteria:
+      - "todo item cita run id, arquivo ou comando"
+      - "pendências contadas e listadas"
+      - "nenhum item 'passou no ciclo anterior' sem reexecução"
+
+  - id: topic_closure
+    role: product-steward
+    skill: [phase-gate]
+    depends_on: [collect_evidence]
+    task: |
+      F8.1–8.6 — feche os 6 tópicos: Sistema (chrome/velvet/wellbeing ausentes), Ocultação (SUSFS +
+      matriz), Integridade (BASIC/DEVICE, STRONG documentado), Apps, Notificações, Backup e OTA
+      (ou limitação declarada). Ledger: {{final_ledger}}
+    output: topic_status
+    artifacts: [agent/artifacts/f8/topics.md]
+    pass_criteria:
+      - "6 tópicos, cada um com PASS/PENDENTE e motivo"
+      - "backup: funciona OU limitação declarada, nunca silêncio"
+      - "limitações não são escondidas em rodapé"
+
+  - id: limitation_review
+    role: privacy-analyst
+    skill: [falsifiable-evidence]
+    depends_on: [topic_closure]
+    task: |
+      Escreva o bloco que vai para a nota: provado · pendente · fora de escopo.
+      Tópicos: {{topic_status}}
+    output: release_limitations
+    pass_criteria:
+      - "três blocos separados e explícitos"
+      - "nenhuma promessa de DEVICE permanente ou STRONG"
+      - "keybox revogada citada como risco de curto prazo, se for o caso"
+
+  - id: release_gate
+    role: release-steward
+    skill: [release-only, artifact-integrity]
+    depends_on: [limitation_review]
+    task: |
+      Decida draft RC: build `success` E staging `complete == true` E ledger sem required pendente.
+      Faltando um, o veredito é PENDENTE (não publica) e o motivo é o bloqueio.
+
+      Limitações: {{release_limitations}}
+    output: rc_decision
+    pass_criteria:
+      - "decisão cita build, staging e ledger"
+      - "SHA256SUMS + SOURCE.tar.gz + RC-NOTES presentes"
+      - "production_authorized=false e production_deployed=false"
+    veto:
+      on: "publicar sem SOURCE.tar.gz"
+      escalate_on: "a pessoa pede release estável sem staging completo"
+
+  - id: final_report
+    role: release-orchestrator
+    skill: [phase-gate, pipeline-fail-closed]
+    depends_on: [release_gate]
+    task: |
+      Relatório final do ciclo: fase a fase, gate a gate, com o fingerprint do processo
+      (`make agent` imprime `agent-process-fingerprint`). Inclua o que ficou aberto.
+
+      Decisão: {{rc_decision}}
+    output: cycle_report
+    artifacts: [agent/artifacts/f8/report.md]
+    pass_criteria:
+      - "toda fase F0–F8 tem veredito e evidência"
+      - "fingerprint do processo citado"
+      - "pendências com dono e próximo comando"
+    handoff:
+      declares:
+        topics_closed: "6/6|string"
+        rc_created: "true|false"
+        not_proven: "lista"
+        process_fingerprint: "sha256"
+      evidence:
+        - "make -s prove"
+        - "gh run view {{run_id}} --json jobs,conclusion"

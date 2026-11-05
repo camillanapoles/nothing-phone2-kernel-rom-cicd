@@ -1,11 +1,17 @@
-# CODEOWNERS - Nothing Phone 2 Kernel/ROM CI/CD
+# CODEOWNERS — Nothing Phone 2 Kernel/ROM CI/CD
+#
+# Um review obrigatório, e o reviewer é a **pessoa dona** (@camillanapoles).
+# Os papéis do agente (product-steward, kernel-architect, security-reviewer, …) são autoridade de
+# processo, não contas humanas — não entram aqui. Quem assina o merge é gente.
 
-# Primary maintainers (must approve all changes)
-@mechanical-coder Primary maintainer
-@android-architect Architecture review
-@security-reviewer Security validation
+*       @camillanapoles
 
-# PR requirements
-# - All changes require at least 1 approval from primary maintainers
-# - All PRs must pass CI validation (stack invariants, kernel build plan)
-# - Modified kernel sources must be published with binaries (GPL-2.0)
+# Processo do agente: mudar papel/habilidade/workflow muda a autoridade de todo mundo.
+/agent/ @camillanapoles
+/AGENT.md @camillanapoles
+
+# Fonte de verdade: objeto canônico exige o dono da decisão, não só o mantenedor.
+/objects/ @camillanapoles
+/kernel/ @camillanapoles
+/scripts/ @camillanapoles
+/.github/workflows/ @camillanapoles

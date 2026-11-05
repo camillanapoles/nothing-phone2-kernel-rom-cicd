@@ -1,0 +1,111 @@
+# F4 — ocultação. Aqui a tentação de "declarar indetectável" é maior; o critério é a matriz.
+name: "F4 · Ocultação de root (SUSFS + app-profile + Zygisk Next)"
+description: "Um módulo por reboot. O PASS é a matriz de detecção, nunca a existência do módulo."
+meta:
+  schema: pong-agent-workflow/1
+  phase: F4
+  owner: device-qa
+  deterministic_gate:
+    kind: device
+    command: "bash scripts/rollout_gate.sh F4"
+    expect: "exit 0; matriz de detecção sem root/zygisk/mount/sus path"
+  source_of_truth: [INSTALL-SEQUENCE.md, objects/install-stack.json]
+  failure_policy: stop-on-fail
+  safety:
+    slot: a
+    one_module_per_reboot: true
+    manual_execution_only: true
+
+llm:
+  provider: host-agent
+  model: ""
+
+inputs:
+  - name: goal
+    description: "o que esta rodada precisa provar (ex.: matriz limpa em 2 apps reais)"
+    required: true
+  - name: target_apps
+    description: "apps reais que a pessoa precisa que funcionem (ex.: Ruru, Duck Detector, banco X)"
+    default: "Ruru, Duck Detector"
+
+steps:
+  - id: susfs_install
+    role: device-qa
+    skill: [phase-gate, falsifiable-evidence]
+    task: |
+      Objetivo: {{goal}}
+      Apps alvo: {{target_apps}}
+
+      F4.1 — SUSFS R28: instalar, reboot, e provar `ksu_susfs show version` igual ao patch do kernel
+      (R28, não "compatível"). Depois: logs off, spoof de uname, make it sus.
+      Um módulo por reboot. Saída literal obrigatória.
+    output: susfs_ledger
+    artifacts: [agent/artifacts/f4/susfs.md]
+    pass_criteria:
+      - "ksu_susfs show version == R28 e == versão do patch no kernel"
+      - "nenhum 'susfs not found' em log"
+      - "apenas um módulo instalado neste boot"
+
+  - id: app_profile_zygisk
+    role: device-qa
+    skill: [phase-gate, falsifiable-evidence]
+    depends_on: [susfs_install]
+    task: |
+      F4.2 — KSU-Next *Umount modules* por app alvo; Zygisk Next com `just_umount`,
+      `linker builtin` e memória anônima — os três aplicados sem reboot.
+
+      Estado anterior: {{susfs_ledger}}
+    output: profile_zygisk_ledger
+    pass_criteria:
+      - "os três toggles do Zygisk Next com estado lido (não presumido)"
+      - "umount por app ativo apenas nos apps alvo"
+      - "Shamiko e Zygisk Assistant ausentes (vetados)"
+
+  - id: detection_matrix
+    role: device-qa
+    skill: [falsifiable-evidence]
+    depends_on: [app_profile_zygisk]
+    task: |
+      F4.6 — a prova que importa: matriz de detecção com Ruru/Duck Detector + os apps reais.
+      Para cada app: sem root, sem zygisk, sem mount inconsistency, sem sus path.
+
+      Ledger anterior: {{profile_zygisk_ledger}}
+    output: detection_matrix
+    artifacts: [agent/artifacts/f4/detection-matrix.md]
+    pass_criteria:
+      - "cada app alvo tem linha própria com resultado e timestamp"
+      - "qualquer detecção = FAIL (não PENDENTE)"
+      - "NoHello só entra se este passo falhar, e nunca junto de Shamiko"
+
+  - id: hiding_limits
+    role: privacy-analyst
+    skill: [falsifiable-evidence]
+    depends_on: [detection_matrix]
+    task: |
+      Escreva o que a ocultação NÃO promete, com base na matriz: apps não testados, superfícies
+      conhecidas, o que muda quando a régua do banco sobe. Matriz: {{detection_matrix}}
+    output: hiding_limits
+    pass_criteria:
+      - "lista de apps NÃO testados explícita"
+      - "nenhuma frase do tipo 'indetectável' ou 'invisível'"
+      - "nenhuma promessa que dependa de app desconhecido"
+
+  - id: phase_verdict
+    role: release-orchestrator
+    skill: [phase-gate]
+    depends_on: [hiding_limits]
+    task: |
+      Feche F4: todos os required em PASS, condicionais declarados, matriz anexada.
+      Limites: {{hiding_limits}}
+    output: f4_verdict
+    pass_criteria:
+      - "nenhum required em PENDENTE"
+      - "NoHello/HMA-OSS declarados como não-usados ou justificados"
+    handoff:
+      declares:
+        susfs: "R28|fail"
+        detection_matrix: "pass|fail"
+        not_tested: "lista"
+      evidence:
+        - "adb shell su -c 'ksu_susfs show version'"
+        - "agent/artifacts/f4/detection-matrix.md"

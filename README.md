@@ -32,6 +32,9 @@ python3 scripts/stack_gate.py --config objects/install-stack.json
 # Validate kernel build plan structure
 python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json
 
+# Validate the agent process (contract, not model)
+python3 scripts/ao_gate.py
+
 # Or use GitHub Actions
 gh workflow run lint.yml
 
@@ -39,17 +42,44 @@ gh workflow run lint.yml
 make stack       # Validate stack invariants
 make prove       # Full build verification
 make kernel-build # Validate kernel build plan
+make agent       # Validate the agent process (roles, skills, workflows, prompts)
+make agent-phase PHASE=F5   # Print the F5 plan in dependency order
+make agent-compat           # Validate the same contract on the real `ao` engine
 ```
+
+## The agent is a process, not a model
+
+[`AGENT.md`](AGENT.md) is the normative contract; [`agent/`](agent/README.md) is its executable form:
+11 roles with declared authority, 7 reusable skills, and one workflow per phase block (F0–F8).
+
+| Question | Answer |
+|---|---|
+| Which model runs it? | Whatever the **host** runs. Nothing here pins one. |
+| What proves a step passed? | `meta.deterministic_gate` — a command/CI job, not a model verdict. |
+| What happens with no evidence? | `PENDENTE` (exit 3). Never `PASS`. |
+| Who may deploy? | Nobody in this repository. The pipeline is release-only; a human flashes. |
+| How do I know *what* ran? | `agent-process-fingerprint` (sha256 of the process files), recorded in CI. |
+
+The form follows [`jnMetaCode/agency-orchestrator`](https://github.com/jnMetaCode/agency-orchestrator)
+(role markdown, declarative YAML, `acceptance` per step, `depends_on` DAG) — with two deliberate
+differences: **no LLM provider in the contract**, and **no self-certification by the model**.
 
 ## Governance
 
 ### Code Owners
 
-All changes require review from the designated code owners:
+All changes require review from the repository owner (`@camillanapoles`), per `.github/CODEOWNERS`.
+Review authority in the process is separate from merge authority:
 
-- `@mechanical-coder` - Primary maintainer
-- `@android-architect` - Architecture review
-- `@security-reviewer` - Security validation
+| Layer | Who | Where |
+|---|---|---|
+| Merge / release | the owner (human) | `.github/CODEOWNERS` |
+| Process authority (decide/veto/advise) | 11 agent roles | `agent/roles/`, summarized in `AGENTS.md` |
+| Enforcement | deterministic gates | `scripts/stack_gate.py`, `scripts/kernel_build_gate.py`, `scripts/ao_gate.py` |
+
+The agent contract is in [`AGENT.md`](AGENT.md). The agent runs on the **host model**: no file in
+this repository pins `provider`, `model`, `base_url` or `api_key` — `make agent` fails the build if
+one appears.
 
 ### Pull Request Requirements
 
@@ -65,11 +95,21 @@ All changes require review from the designated code owners:
 
 ```
 objects/          -> stack_gate.py validates invariants
+agent/            -> ao_gate.py validates the agent process (roles, skills, workflows)
 scripts/          -> Build and validation scripts
-.github/workflows/ -> Automated CI/CD pipelines
+.github/workflows/ -> Automated CI/CD pipelines (release-only, fail-closed)
 kernel/           -> Kernel source and patches
 Makefile          -> Build verification targets
 ```
+
+### Agent process
+
+- `AGENT.md` - normative contract: authority boundary, handoff, what the agent is **not**
+- `agent/roles/` - 11 roles with declared authority (`decide`/`recommend`/`veto`/`advise`/`report`)
+- `agent/skills/` - 7 reusable methods (`pin-discipline`, `falsifiable-evidence`, …)
+- `agent/workflows/` - one YAML per phase block, each with a `meta.deterministic_gate`
+- `agent/prompts/` - composable prompt (published to `.claude/agents/pong-orchestrator.md`)
+- `scripts/ao_gate.py` - the gate that enforces all of the above
 
 ### Object Definitions
 

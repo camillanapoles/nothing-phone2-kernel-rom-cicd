@@ -112,6 +112,17 @@ Uses `actions/checkout@3d3c42e5...` and `actions/cache@55cc8345...` for ccache p
 ---
 
 
+# Agent contract (read this first)
+
+O agente deste repo é **processo, não modelo**. O contrato normativo é `AGENT.md`; a forma
+executável é `agent/` (11 papéis, 7 habilidades, workflows por bloco de fase, prompt componível).
+O gate `scripts/ao_gate.py` reprova qualquer pin de `provider`/`model`/`base_url`/`api_key` em
+`agent/**` — o modelo é o do host e trocá-lo não muda veredito.
+
+Forma herdada de `jnMetaCode/agency-orchestrator` (papéis em markdown, YAML declarativo,
+`acceptance` por passo, DAG por `depends_on`), sem as duas coisas que não servem aqui: provider de
+LLM no contrato e auto-certificação do modelo.
+
 # Build Commands
 ```bash
 # Validate stack invariants (16 checks)
@@ -120,9 +131,15 @@ python3 scripts/stack_gate.py --config objects/install-stack.json
 # Validate kernel build plan
 python3 scripts/kernel_build_gate.py --config objects/kernel-build-plan.json
 
+# Validate the agent process (roles, skills, workflows, prompts)
+python3 scripts/ao_gate.py
+
+# Prove the agent gate actually rejects
+python3 scripts/test_agent_contract.py
+
 # Run all CI checks
 make stack   # Validates JSON against schema and invariants
-make prove   # Full build verification
+make prove   # Full fail-closed verification (stack + kernel + agent + boundary + mutation)
 ```
 
 ## Python Environment
@@ -130,6 +147,8 @@ make prove   # Full build verification
 - JSON schema validation via `jsonschema` package (install with `pip install jsonschema`)
 
 ## Critical Constraints
+- **O modelo é do host** - nenhum arquivo pina `provider`, `model`, `base_url` ou `api_key`;
+  `make agent` reprova. Papéis declaram autoridade; gates declaram veredito.
 - **Never commit modified binaries** - `objects/*.json` files are source of truth and must not be edited without updating corresponding artifacts
 - **Slot A only** - This project is configured for single-slot flash only; install sequence in `INSTALL-SEQUENCE.md` assumes Slot A
 - **Pinned actions only** - All GitHub Actions must use full 40-character SHA hashes; no `@vN` tags
@@ -137,10 +156,12 @@ make prove   # Full build verification
 
 ## Repository Structure
 ```
+AGENT.md          # Contrato normativo do agente (processo, não modelo)
+agent/            # Papéis, habilidades, workflows, prompts — a forma executável
 objects/          # JSON source of truth (install-stack, build plans, artifacts)
 kernel/           # Kernel source, patches, config fragments
-scripts/          # Validation scripts (stack_gate.py, kernel_build_gate.py)
-.github/workflows/  # GitHub Actions CI/CD
+scripts/          # Gates (stack_gate, kernel_build_gate, ao_gate, workflow_audit)
+.github/workflows/  # GitHub Actions CI/CD (release-only, fail-closed)
 ```
 
 ## Security
